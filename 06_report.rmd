@@ -1,0 +1,92 @@
+---
+title: "Individual Assignment: Data Cleaning & Imputation Pipeline in R" 
+author: "Nicky Melville"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 2
+    reference_docx: "report_template.docx" 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(knitr)
+library(digest)
+```
+
+## Objective
+
+This is an individual technical assessment that directly supports the Unit's medium-term goal of establishing an official internal pipeline for data cleaning and imputation, with reproducible reports as a standard deliverable.
+
+## Raw Dataset
+
+The raw dataset is not stored in this GitHub repository because it is larger than GitHub's 100 MB file size limit.
+
+Download the raw file from Google Drive here:
+https://drive.google.com/drive/folders/1VQjKMT0UZDbJzx_QmlaUPVwQfFXhHsL-?usp=drive_link
+
+After downloading, place the file in this folder:
+
+Raw_data/shein_sample.csv
+
+## 0. File Configuration
+
+```{r hash-check}
+#https://drive.google.com/drive/folders/1VQjKMT0UZDbJzx_QmlaUPVwQfFXhHsL-?usp=drive_link
+
+```
+
+
+---
+
+## 1. Structural Validation
+
+```{r load-data}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(tidyr)
+library(scales)
+
+raw_file <- read_csv(raw_data_path)
+nrow(raw_file)
+ncol(raw_file)
+names(raw_file)
+head(raw_file)
+class(raw_file)
+str(raw_file)
+summary(raw_file)
+```
+
+
+---
+
+## 2. Diagnosis and Missing Values
+
+
+---
+
+## 3. Cleaning Log
+
+
+---
+
+
+## 4. Imputation
+
+
+---
+
+
+## 5. Exports
+
+
+---
+
+
+## 6. Summary Statistics (Post-Cleaning)
+
