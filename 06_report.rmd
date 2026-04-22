@@ -22,19 +22,19 @@ This is an individual technical assessment that directly supports the Unit's med
 
 ## Raw Dataset
 
-The raw dataset is not stored in this GitHub repository because it is larger than GitHub's 100 MB file size limit.
+Due to the large file size, before running the project, install Git LFS and run:
 
-Download the raw file from Google Drive here:
-https://drive.google.com/drive/folders/1VQjKMT0UZDbJzx_QmlaUPVwQfFXhHsL-?usp=drive_link
-
-After downloading, place the file in this folder:
-
-Raw_data/shein_sample.csv
+git lfs install
+git lfs pull
 
 ## 0. File Configuration
 
 ```{r hash-check}
-#https://drive.google.com/drive/folders/1VQjKMT0UZDbJzx_QmlaUPVwQfFXhHsL-?usp=drive_link
+raw_file_path <- "Raw_data/shein_sample.csv"
+
+if (!file.exists(raw_file_path)) {
+        stop("The raw data file was not found. Please check that shein_sample.csv is inside the Raw_data folder.")
+}
 
 ```
 
@@ -44,6 +44,7 @@ Raw_data/shein_sample.csv
 ## 1. Structural Validation
 
 ```{r load-data}
+#Load Libraries
 library(readxl)
 library(dplyr)
 library(ggplot2)
@@ -51,12 +52,29 @@ library(readr)
 library(stringr)
 library(tidyr)
 library(scales)
+library(data.table)
+library(openxlsx)
+library(stringi)
+library(lubridate)
 
-raw_file <- read_csv(raw_data_path)
-nrow(raw_file)
-ncol(raw_file)
-names(raw_file)
+#Read in the raw dataset
+raw_file <- fread(
+        raw_file_path,
+        encoding = "UTF-8",
+        fill = TRUE,
+        quote = "\""
+)
+
+raw_file <- as.data.frame(raw_file)
+
+cat("Raw data loaded successfully.\n")
+cat("Rows:", nrow(raw_file), "\n")
+cat("Columns:", ncol(raw_file), "\n")
+
+#Validating the data compared to the Source Document
+dim(raw_file)
 head(raw_file)
+names(raw_file)
 class(raw_file)
 str(raw_file)
 summary(raw_file)
@@ -66,27 +84,41 @@ summary(raw_file)
 ---
 
 ## 2. Diagnosis and Missing Values
+```{r}
+#Exploratory Diagnosis exported to Excel file for viewing.
 
-
+```
 ---
 
 ## 3. Cleaning Log
+```{r}
 
+
+```
 
 ---
 
 
 ## 4. Imputation
+```{r}
 
+
+```
 
 ---
 
 
 ## 5. Exports
+```{r}
 
+
+```
 
 ---
 
 
 ## 6. Summary Statistics (Post-Cleaning)
+```{r}
 
+
+```
