@@ -6,7 +6,6 @@ output:
   word_document:
     toc: true
     toc_depth: 2
-    reference_docx: "report_template.docx" 
 ---
 
 ```{r setup, include=FALSE}
@@ -73,11 +72,9 @@ cat("Columns:", ncol(raw_file), "\n")
 
 #Validating the data compared to the Source Document
 dim(raw_file)
-head(raw_file)
 names(raw_file)
 class(raw_file)
-str(raw_file)
-summary(raw_file)
+
 ```
 
 
@@ -85,9 +82,14 @@ summary(raw_file)
 
 ## 2. Diagnosis and Missing Values
 
-Notable missing columns include Discount, Category and Scraped at. Although "Category" can be substituted to main other descriptors. No Category itself is present.
+Notable missing columns include Discount, Category and Scraped at. Although "Category" can be substituted to mean other descriptors in the description column. No Category itself is present.
+Another notable observation includes scraped_at dates being present in image URLs, including several duplicates within one cell that can be noted.
+
+Most of the Exploratory Diagnosis is exported to Excel file for viewing.
+
 ```{r}
-#Exploratory Diagnosis exported to Excel file for viewing.
+# Count records that contain duplicate image URLs
+
 
 ```
 ---
