@@ -1,7 +1,6 @@
 #01_ingest.r
 
 #Load Libraries
-
 library(readxl)
 library(dplyr)
 library(ggplot2)
@@ -13,6 +12,7 @@ library(data.table)
 library(openxlsx)
 library(stringi)
 library(lubridate)
+library(purrr)
 
 #Read in the raw dataset
 raw_file <- fread(
@@ -29,7 +29,7 @@ cat("Rows:", nrow(raw_file), "\n")
 cat("Columns:", ncol(raw_file), "\n")
 
 
-View(raw_file)
+# View(raw_file)
 
 #Validating the data compared to the Source Document
 dim(raw_file)
@@ -40,7 +40,7 @@ str(raw_file)
 summary(raw_file)
 
 
-###################Create a small excel file to view data######################
+###################Creating a small excel file sample to view data######################
 # dir.create("small_sample", showWarnings = FALSE)
 # 
 # # Take the first 50 rows

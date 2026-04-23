@@ -28,7 +28,7 @@ clean_df_for_excel <- function(data) {
         )
 }
 
-# Helper to find likely columns by name
+# Helper to find expected D5 columns by name
 find_col <- function(pattern) {
         hits <- names(df)[str_detect(tolower(names(df)), pattern)]
         if (length(hits) == 0) {
@@ -38,16 +38,100 @@ find_col <- function(pattern) {
         }
 }
 
-product_col <- find_col("product.*name|product_name|title|name")
-price_col <- find_col("^price$|price|sale.*price|current.*price")
+product_col <- find_col("name")
+price_col <- find_col("price")
 discount_col <- find_col("discount|markdown|promo")
 color_col <- find_col("color|colour")
 size_col <- find_col("^size$|sizes")
 category_col <- find_col("category|department|class")
 material_col <- find_col("material|fabric")
 product_url_col <- find_col("product.*url|url|link")
-image_url_col <- find_col("image.*url|image|img")
+image_url_col <- find_col("image")
 scraped_at_col <- find_col("scraped|date|time|timestamp")
+
+
+# #===========================================================================
+# #Confirming no instance of discount or dates are mentioned in "description"
+# #using key value pairs and displaying every instance.
+# 
+# 
+# ## Add row number so each extracted value can be matched back to the correct row
+df <- df %>%
+        mutate(row_number = row_number())
+
+# Extract all key-value pairs from description
+description_pairs <- map2_dfr(
+        df$row_number,
+        df$description,
+        function(rn, desc_text) {
+
+                if (is.na(desc_text) || desc_text == "") {
+                        return(data.frame(
+                                row_number = integer(0),
+                                attribute_name = character(0),
+                                attribute_value = character(0)
+                        ))
+                }
+
+                matches <- str_match_all(
+                        desc_text,
+                        "'([^']+)'\\s*:\\s*'([^']*)'"
+                )[[1]]
+
+                if (nrow(matches) == 0) {
+                        return(data.frame(
+                                row_number = integer(0),
+                                attribute_name = character(0),
+                                attribute_value = character(0)
+                        ))
+                }
+
+                data.frame(
+                        row_number = rn,
+                        attribute_name = matches[, 2],
+                        attribute_value = matches[, 3],
+                        stringsAsFactors = FALSE
+                )
+        }
+)
+
+# # View every extracted instance
+# description_pairs
+
+# Note, it s impossible to display all 1.38 million instances of all key-values
+##############[ reached 'max' / getOption("max.print") -- omitted 1382900 rows ]
+
+
+# =====================================================
+# Summaries from description_pairs
+# =====================================================
+
+description_pairs <- description_pairs %>%
+        mutate(
+                attribute_name = stringr::str_squish(as.character(attribute_name)),
+                attribute_value = stringr::str_squish(as.character(attribute_value))
+        )
+
+# Count of each unique attribute name
+description_attribute_name_counts <- description_pairs %>%
+        filter(!is.na(attribute_name), attribute_name != "") %>%
+        count(attribute_name, sort = TRUE, name = "count")
+
+# Count of each unique attribute value across all extracted values
+description_attribute_value_counts <- description_pairs %>%
+        filter(!is.na(attribute_value), attribute_value != "") %>%
+        count(attribute_value, sort = TRUE, name = "count")
+
+# Optional but very useful:
+# Count of each unique attribute name + attribute value combination
+description_name_value_counts <- description_pairs %>%
+        filter(
+                !is.na(attribute_name), attribute_name != "",
+                !is.na(attribute_value), attribute_value != ""
+        ) %>%
+        count(attribute_name, attribute_value, sort = TRUE, name = "count")
+
+#Confirmed no instance of discount or scraped-at exists in the description.
 
 # =====================================================
 # 2. Dataset overview
@@ -71,7 +155,7 @@ overview <- data.frame(
                 sum(colSums(is.na(df) | df == "") > 0)
         )
 )
-View(overview)
+#View(overview)
 
 detected_columns <- data.frame(
         expected_field = c(
@@ -99,7 +183,7 @@ detected_columns <- data.frame(
                 scraped_at_col
         )
 )
-View(detected_columns)
+#View(detected_columns)
 
 # =====================================================
 # 3. Variable types and structure
@@ -546,6 +630,9 @@ add_sheet <- function(workbook, sheet_name, data) {
 
 add_sheet(wb, "Overview", overview)
 add_sheet(wb, "Detected Columns", detected_columns)
+add_sheet(wb, "Description Attr Names", description_attribute_name_counts)
+add_sheet(wb, "Description Attr Values", description_attribute_value_counts)
+add_sheet(wb, "Description Name-Value", description_name_value_counts)
 add_sheet(wb, "Variable Types", variable_types)
 add_sheet(wb, "Missingness Variable", missingness_by_variable)
 add_sheet(wb, "Missingness Row", missingness_by_row_summary)

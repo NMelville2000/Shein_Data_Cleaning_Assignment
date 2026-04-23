@@ -84,6 +84,8 @@ summary(raw_file)
 ---
 
 ## 2. Diagnosis and Missing Values
+
+Notable missing columns include Discount, Category and Scraped at. Although "Category" can be substituted to main other descriptors. No Category itself is present.
 ```{r}
 #Exploratory Diagnosis exported to Excel file for viewing.
 
