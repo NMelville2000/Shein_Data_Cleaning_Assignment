@@ -1,141 +1,94 @@
-#02_diagnosis.r
+# =============================================================================
+# 02_diagnosis.R
+# Project:  Shein Data Quality Pipeline
+# Purpose:  Produce a comprehensive exploratory-diagnostics workbook covering:
+#             • Dataset overview
+#             • Variable types & missingness
+#             • Duplicate detection
+#             • Numeric range checks & outlier flags
+#             • Price / discount sanity checks
+#             • URL validity checks
+#             • Date / scrape-timestamp parsing
+#             • Text quality checks
+#             • Category / color / size / material level summaries
+#             • Description key-value extraction
+#             • Flagged problem rows
+# Output:   Output/shein_exploratory_diagnostics.xlsx
+# Depends:  00_config.R + 01_ingest.R (raw_file must exist in environment)
+# =============================================================================
 
-#Exploratory Diagnostics for Full Raw Data Frame
+#source("00_config.R")
 
-# =====================================================
-# 1. Basic setup
-# =====================================================
+if (!exists("raw_file")) source("01_ingest.R")
 
-df <- raw_file
+dir.create(OUTPUT_DIR, showWarnings = FALSE)
 
-dir.create("Output", showWarnings = FALSE)
+# =============================================================================
+# SECTION A — Helpers
+# =============================================================================
 
-output_file <- "Output/shein_exploratory_diagnostics.xlsx"
+# ---------------------------------------------------------------------------
+# A1. Excel text sanitiser — strips control characters that break openxlsx
+# ---------------------------------------------------------------------------
 
-# Clean invalid text so Excel export does not fail
-clean_text_for_excel <- function(x) {
+clean_for_excel <- function(x) {
         if (is.character(x)) {
                 x <- stri_enc_toutf8(x, is_unknown_8bit = TRUE)
                 x <- stri_replace_all_regex(x, "\\p{C}", "")
         }
-        return(x)
+        x
 }
 
 clean_df_for_excel <- function(data) {
-        as.data.frame(
-                lapply(data, clean_text_for_excel),
-                stringsAsFactors = FALSE
-        )
+        as.data.frame(lapply(data, clean_for_excel), stringsAsFactors = FALSE)
 }
 
-# Helper to find expected D5 columns by name
-find_col <- function(pattern) {
+# ---------------------------------------------------------------------------
+# A2. Column auto-detector — returns the first column name matching a pattern
+# ---------------------------------------------------------------------------
+
+find_col <- function(df, pattern) {
         hits <- names(df)[str_detect(tolower(names(df)), pattern)]
-        if (length(hits) == 0) {
-                return(NA_character_)
-        } else {
-                return(hits[1])
-        }
+        if (length(hits) == 0) NA_character_ else hits[1]
 }
 
-product_col <- find_col("name")
-price_col <- find_col("price")
-discount_col <- find_col("discount|markdown|promo")
-color_col <- find_col("color|colour")
-size_col <- find_col("^size$|sizes")
-category_col <- find_col("category|department|class")
-material_col <- find_col("material|fabric")
-product_url_col <- find_col("product.*url|url|link")
-image_url_col <- find_col("image")
-scraped_at_col <- find_col("scraped|date|time|timestamp")
+# ---------------------------------------------------------------------------
+# A3. openxlsx helper — add a sheet with auto-width columns
+# ---------------------------------------------------------------------------
 
+add_sheet <- function(wb, sheet_name, data) {
+        addWorksheet(wb, sheet_name)
+        writeData(wb, sheet_name, clean_df_for_excel(data))
+        setColWidths(wb, sheet_name, cols = seq_len(ncol(data)), widths = "auto")
+}
 
-# #===========================================================================
-# #Confirming no instance of discount or dates are mentioned in "description"
-# #using key value pairs and displaying every instance.
-# 
-# 
-# ## Add row number so each extracted value can be matched back to the correct row
-df <- df %>%
-        mutate(row_number = row_number())
+# =============================================================================
+# SECTION B — Setup: working copy & column mapping
+# =============================================================================
 
-# Extract all key-value pairs from description
-description_pairs <- map2_dfr(
-        df$row_number,
-        df$description,
-        function(rn, desc_text) {
+df <- raw_file %>% mutate(row_number = row_number())
 
-                if (is.na(desc_text) || desc_text == "") {
-                        return(data.frame(
-                                row_number = integer(0),
-                                attribute_name = character(0),
-                                attribute_value = character(0)
-                        ))
-                }
-
-                matches <- str_match_all(
-                        desc_text,
-                        "'([^']+)'\\s*:\\s*'([^']*)'"
-                )[[1]]
-
-                if (nrow(matches) == 0) {
-                        return(data.frame(
-                                row_number = integer(0),
-                                attribute_name = character(0),
-                                attribute_value = character(0)
-                        ))
-                }
-
-                data.frame(
-                        row_number = rn,
-                        attribute_name = matches[, 2],
-                        attribute_value = matches[, 3],
-                        stringsAsFactors = FALSE
-                )
-        }
+# --- Detect expected columns by heuristic name patterns ---
+detected <- list(
+        product     = find_col(df, "product.*name|product_name|title|^name$"),
+        price       = find_col(df, "^price$|sale.*price|current.*price|price"),
+        discount    = find_col(df, "discount|markdown|promo"),
+        color       = find_col(df, "colou?r"),
+        size        = find_col(df, "^size$|sizes"),
+        category    = find_col(df, "category|department|class"),
+        material    = find_col(df, "material|fabric"),
+        product_url = find_col(df, "product.*url|^url$|^link$"),
+        image_url   = find_col(df, "image.*url|^image$|^img$"),
+        scraped_at  = find_col(df, "scraped|timestamp|scraped_at")
 )
 
-# # View every extracted instance
-# description_pairs
+# =============================================================================
+# SECTION C — Diagnostics
+# =============================================================================
 
-# Note, it s impossible to display all 1.38 million instances of all key-values
-##############[ reached 'max' / getOption("max.print") -- omitted 1382900 rows ]
-
-
-# =====================================================
-# Summaries from description_pairs
-# =====================================================
-
-description_pairs <- description_pairs %>%
-        mutate(
-                attribute_name = stringr::str_squish(as.character(attribute_name)),
-                attribute_value = stringr::str_squish(as.character(attribute_value))
-        )
-
-# Count of each unique attribute name
-description_attribute_name_counts <- description_pairs %>%
-        filter(!is.na(attribute_name), attribute_name != "") %>%
-        count(attribute_name, sort = TRUE, name = "count")
-
-# Count of each unique attribute value across all extracted values
-description_attribute_value_counts <- description_pairs %>%
-        filter(!is.na(attribute_value), attribute_value != "") %>%
-        count(attribute_value, sort = TRUE, name = "count")
-
-# Optional but very useful:
-# Count of each unique attribute name + attribute value combination
-description_name_value_counts <- description_pairs %>%
-        filter(
-                !is.na(attribute_name), attribute_name != "",
-                !is.na(attribute_value), attribute_value != ""
-        ) %>%
-        count(attribute_name, attribute_value, sort = TRUE, name = "count")
-
-#Confirmed no instance of discount or scraped-at exists in the description.
-
-# =====================================================
-# 2. Dataset overview
-# =====================================================
+# ---------------------------------------------------------------------------
+# C1. Dataset overview
+# ---------------------------------------------------------------------------
 
 overview <- data.frame(
         metric = c(
@@ -143,8 +96,8 @@ overview <- data.frame(
                 "Total columns",
                 "Total cells",
                 "Exact duplicate rows",
-                "Rows with at least one missing value",
-                "Columns with at least one missing value"
+                "Rows with ≥1 missing value",
+                "Columns with ≥1 missing value"
         ),
         value = c(
                 nrow(df),
@@ -155,85 +108,101 @@ overview <- data.frame(
                 sum(colSums(is.na(df) | df == "") > 0)
         )
 )
-#View(overview)
 
-detected_columns <- data.frame(
-        expected_field = c(
-                "Product name",
-                "Price",
-                "Discount",
-                "Color",
-                "Size",
-                "Category",
-                "Material",
-                "Product URL",
-                "Image URL",
-                "Scraped date or time"
-        ),
-        detected_column = c(
-                product_col,
-                price_col,
-                discount_col,
-                color_col,
-                size_col,
-                category_col,
-                material_col,
-                product_url_col,
-                image_url_col,
-                scraped_at_col
-        )
+detected_columns_tbl <- data.frame(
+        expected_field   = names(detected),
+        detected_column  = unlist(detected),
+        row.names        = NULL
 )
-#View(detected_columns)
 
-# =====================================================
-# 3. Variable types and structure
-# =====================================================
+# ---------------------------------------------------------------------------
+# C2. Description key-value extraction
+# ---------------------------------------------------------------------------
+
+message("[diagnosis] Extracting description key-value pairs ...")
+
+description_pairs <- map2_dfr(
+        df$row_number,
+        df$description,
+        function(rn, txt) {
+                if (is.na(txt) || txt == "") return(NULL)
+                m <- str_match_all(txt, "'([^']+)'\\s*:\\s*'([^']*)'")[[1]]
+                if (nrow(m) == 0) return(NULL)
+                data.frame(
+                        row_number      = rn,
+                        attribute_name  = m[, 2],
+                        attribute_value = m[, 3],
+                        stringsAsFactors = FALSE
+                )
+        }
+)
+
+description_pairs <- description_pairs %>%
+        mutate(
+                attribute_name  = str_squish(attribute_name),
+                attribute_value = str_squish(attribute_value)
+        )
+
+desc_attr_name_counts <- description_pairs %>%
+        filter(!is.na(attribute_name), attribute_name != "") %>%
+        count(attribute_name, sort = TRUE, name = "count")
+
+desc_attr_value_counts <- description_pairs %>%
+        filter(!is.na(attribute_value), attribute_value != "") %>%
+        count(attribute_value, sort = TRUE, name = "count")
+
+desc_name_value_counts <- description_pairs %>%
+        filter(
+                !is.na(attribute_name),  attribute_name  != "",
+                !is.na(attribute_value), attribute_value != ""
+        ) %>%
+        count(attribute_name, attribute_value, sort = TRUE, name = "count")
+
+# ---------------------------------------------------------------------------
+# C3. Variable types & structure
+# ---------------------------------------------------------------------------
 
 variable_types <- data.frame(
-        variable = names(df),
-        r_type = sapply(df, function(x) paste(class(x), collapse = ", ")),
-        non_missing_count = sapply(df, function(x) sum(!(is.na(x) | x == ""))),
-        missing_count = sapply(df, function(x) sum(is.na(x) | x == "")),
-        unique_count = sapply(df, function(x) length(unique(x))),
-        stringsAsFactors = FALSE
-)
+        variable          = names(df),
+        r_type            = sapply(df, \(x) paste(class(x), collapse = ", ")),
+        non_missing_count = sapply(df, \(x) sum(!(is.na(x) | x == ""))),
+        missing_count     = sapply(df, \(x) sum(is.na(x)  | x == "")),
+        unique_count      = sapply(df, \(x) length(unique(x))),
+        stringsAsFactors  = FALSE
+) %>%
+        mutate(missing_pct = round(missing_count / nrow(df) * 100, 2)) %>%
+        arrange(desc(missing_pct))
 
-variable_types$missing_percent <- round(
-        variable_types$missing_count / nrow(df) * 100,
-        2
-)
-
-variable_types <- variable_types %>%
-        arrange(desc(missing_percent))
-
-# =====================================================
-# 4. Missingness by variable
-# =====================================================
+# ---------------------------------------------------------------------------
+# C4. Missingness
+# ---------------------------------------------------------------------------
 
 missingness_by_variable <- data.frame(
-        variable = names(df),
-        missing_count = sapply(df, function(x) sum(is.na(x) | x == "")),
-        non_missing_count = sapply(df, function(x) sum(!(is.na(x) | x == ""))),
-        missing_percent = round(
-                sapply(df, function(x) sum(is.na(x) | x == "")) / nrow(df) * 100,
-                2
+        variable      = names(df),
+        missing_count = sapply(df, \(x) sum(is.na(x) | x == "")),
+        non_missing   = sapply(df, \(x) sum(!(is.na(x) | x == ""))),
+        missing_pct   = round(
+                sapply(df, \(x) sum(is.na(x) | x == "")) / nrow(df) * 100, 2
         ),
         stringsAsFactors = FALSE
 ) %>%
-        arrange(desc(missing_percent))
+        arrange(desc(missing_pct))
 
-# Missingness by row
-missingness_by_row_summary <- data.frame(
-        missing_values_per_row = rowSums(is.na(df) | df == ""),
-        row_count = 1
+missingness_by_row <- data.frame(
+        missing_values_per_row = rowSums(is.na(df) | df == "")
 ) %>%
-        group_by(missing_values_per_row) %>%
-        summarise(row_count = sum(row_count), .groups = "drop") %>%
+        count(missing_values_per_row, name = "row_count") %>%
         arrange(desc(missing_values_per_row))
 
-# =====================================================
-# 5. Duplicate checks
-# =====================================================
+# ---------------------------------------------------------------------------
+# C5. Duplicate checks
+# ---------------------------------------------------------------------------
+
+safe_dup_count <- function(col_name) {
+        if (is.na(col_name)) return(NA_integer_)
+        v <- df[[col_name]]
+        sum(duplicated(v) & !(is.na(v) | v == ""))
+}
 
 duplicate_summary <- data.frame(
         check = c(
@@ -244,411 +213,322 @@ duplicate_summary <- data.frame(
         ),
         count = c(
                 sum(duplicated(df)),
-                if (!is.na(product_url_col)) sum(duplicated(df[[product_url_col]]) & !(is.na(df[[product_url_col]]) | df[[product_url_col]] == "")) else NA,
-                if (!is.na(product_col)) sum(duplicated(df[[product_col]]) & !(is.na(df[[product_col]]) | df[[product_col]] == "")) else NA,
-                if (!is.na(image_url_col)) sum(duplicated(df[[image_url_col]]) & !(is.na(df[[image_url_col]]) | df[[image_url_col]] == "")) else NA
+                safe_dup_count(detected$product_url),
+                safe_dup_count(detected$product),
+                safe_dup_count(detected$image_url)
         )
 )
 
-exact_duplicate_examples <- df[duplicated(df) | duplicated(df, fromLast = TRUE), ]
-exact_duplicate_examples <- head(exact_duplicate_examples, 50)
+exact_dup_examples <- head(df[duplicated(df) | duplicated(df, fromLast = TRUE), ],
+                           EXCEL_SAMPLE_ROWS)
 
-if (!is.na(product_url_col)) {
-        duplicate_product_url_examples <- df[
-                duplicated(df[[product_url_col]]) | duplicated(df[[product_url_col]], fromLast = TRUE),
-        ]
-        duplicate_product_url_examples <- duplicate_product_url_examples[
-                !(is.na(duplicate_product_url_examples[[product_url_col]]) | duplicate_product_url_examples[[product_url_col]] == ""),
-        ]
-        duplicate_product_url_examples <- head(duplicate_product_url_examples, 50)
+if (!is.na(detected$product_url)) {
+        pu <- df[[detected$product_url]]
+        dup_url_examples <- head(
+                df[(duplicated(pu) | duplicated(pu, fromLast = TRUE)) & !(is.na(pu) | pu == ""), ],
+                EXCEL_SAMPLE_ROWS
+        )
 } else {
-        duplicate_product_url_examples <- data.frame(note = "No product URL column detected.")
+        dup_url_examples <- data.frame(note = "No product URL column detected.")
 }
 
-# =====================================================
-# 6. Numeric and range checks
-# =====================================================
+# Image URL duplication — explode comma-separated lists
+message("[diagnosis] Checking image URL duplication ...")
 
-numeric_columns <- names(df)[sapply(df, is.numeric)]
+exploded_images <- df %>%
+        separate_rows(images, sep = ",\\s*") %>%
+        mutate(images = trimws(str_remove_all(images, "[\\[\\]']"))) %>%
+        filter(!is.na(images), images != "")
 
-numeric_like_columns <- names(df)[
-        str_detect(
-                tolower(names(df)),
-                "price|cost|amount|discount|rating|review|stock|quantity|qty|count|sales|weight"
+image_url_counts <- exploded_images %>%
+        count(images, sort = TRUE, name = "count")
+
+records_with_dup_images <- df %>%
+        rowwise() %>%
+        mutate(
+                url_list      = list(trimws(str_remove_all(unlist(strsplit(images, ",\\s*")), "[\\[\\]']"))),
+                has_duplicates = length(url_list) != length(unique(url_list))
+        ) %>%
+        ungroup() %>%
+        filter(has_duplicates)
+
+image_dup_summary <- data.frame(
+        metric = c(
+                "Records with at least one duplicate image URL",
+                "Pct of total records"
+        ),
+        value = c(
+                nrow(records_with_dup_images),
+                paste0(round(nrow(records_with_dup_images) / nrow(df) * 100, 2), "%")
         )
-]
+)
 
-range_check_columns <- unique(c(numeric_columns, numeric_like_columns))
+# ---------------------------------------------------------------------------
+# C6. Numeric range checks
+# ---------------------------------------------------------------------------
 
-range_checks <- data.frame()
+message("[diagnosis] Running numeric range checks ...")
+
+numeric_cols      <- names(df)[sapply(df, is.numeric)]
+numeric_like_cols <- names(df)[str_detect(
+        tolower(names(df)),
+        "price|cost|amount|discount|rating|review|stock|quantity|qty|count|sales|weight"
+)]
+
+range_check_cols <- unique(c(numeric_cols, numeric_like_cols))
+
+range_checks       <- data.frame()
 numeric_parse_issues <- data.frame()
 
-for (col in range_check_columns) {
+for (col in range_check_cols) {
         
-        x <- df[[col]]
+        x     <- df[[col]]
         x_chr <- as.character(x)
         
-        # Treat common messy missing values as NA
-        messy_missing_values <- c(
-                "",
-                "NA",
-                "N/A",
-                "na",
-                "n/a",
-                "null",
-                "NULL",
-                "undefined",
-                "Undefined",
-                "UNDEFINED"
-        )
+        parsed <- if (is.numeric(x)) x else parse_number(x_chr, na = MESSY_MISSING_VALUES)
         
-        if (is.numeric(x)) {
-                parsed_x <- x
-        } else {
-                parsed_x <- parse_number(
-                        x_chr,
-                        na = messy_missing_values
+        # Collect values that failed to parse
+        failed_idx <- which(is.na(parsed) & !(is.na(x_chr) | x_chr %in% MESSY_MISSING_VALUES))
+        if (length(failed_idx) > 0) {
+                numeric_parse_issues <- bind_rows(
+                        numeric_parse_issues,
+                        data.frame(
+                                variable       = col,
+                                row_number     = failed_idx,
+                                original_value = x_chr[failed_idx],
+                                issue          = "Value could not be parsed as a number"
+                        )
                 )
         }
         
-        # Find values that could not be parsed into numbers
-        parse_issue_rows <- which(
-                is.na(parsed_x) &
-                        !(is.na(x_chr) | x_chr %in% messy_missing_values)
-        )
+        vals <- parsed[!is.na(parsed)]
+        if (length(vals) == 0) next
         
-        if (length(parse_issue_rows) > 0) {
-                temp_issues <- data.frame(
-                        variable = col,
-                        row_number = parse_issue_rows,
-                        original_value = x_chr[parse_issue_rows],
-                        issue = "Value could not be parsed as a number"
-                )
-                
-                numeric_parse_issues <- bind_rows(numeric_parse_issues, temp_issues)
-        }
+        q1  <- quantile(vals, 0.25)
+        q3  <- quantile(vals, 0.75)
+        iqr <- q3 - q1
         
-        parsed_x_non_missing <- parsed_x[!is.na(parsed_x)]
-        
-        if (length(parsed_x_non_missing) > 0) {
-                
-                q1 <- quantile(parsed_x_non_missing, 0.25, na.rm = TRUE)
-                q3 <- quantile(parsed_x_non_missing, 0.75, na.rm = TRUE)
-                iqr_value <- q3 - q1
-                
-                lower_bound <- q1 - 1.5 * iqr_value
-                upper_bound <- q3 + 1.5 * iqr_value
-                
-                temp <- data.frame(
-                        variable = col,
-                        original_type = paste(class(x), collapse = ", "),
-                        parsed_numeric_count = sum(!is.na(parsed_x)),
-                        parsed_numeric_percent = round(sum(!is.na(parsed_x)) / nrow(df) * 100, 2),
-                        min = min(parsed_x_non_missing, na.rm = TRUE),
-                        q1 = q1,
-                        median = median(parsed_x_non_missing, na.rm = TRUE),
-                        mean = mean(parsed_x_non_missing, na.rm = TRUE),
-                        q3 = q3,
-                        max = max(parsed_x_non_missing, na.rm = TRUE),
-                        negative_count = sum(parsed_x < 0, na.rm = TRUE),
-                        zero_count = sum(parsed_x == 0, na.rm = TRUE),
-                        possible_outlier_count = sum(parsed_x < lower_bound | parsed_x > upper_bound, na.rm = TRUE)
-                )
-                
-                range_checks <- bind_rows(range_checks, temp)
-        }
+        range_checks <- bind_rows(range_checks, data.frame(
+                variable               = col,
+                original_type          = paste(class(x), collapse = ", "),
+                parsed_count           = sum(!is.na(parsed)),
+                parsed_pct             = round(sum(!is.na(parsed)) / nrow(df) * 100, 2),
+                min                    = min(vals),
+                q1                     = q1,
+                median                 = median(vals),
+                mean                   = mean(vals),
+                q3                     = q3,
+                max                    = max(vals),
+                negative_count         = sum(vals < 0),
+                zero_count             = sum(vals == 0),
+                iqr_outlier_count      = sum(parsed < (q1 - IQR_MULTIPLIER * iqr) |
+                                                     parsed > (q3 + IQR_MULTIPLIER * iqr), na.rm = TRUE)
+        ))
 }
 
-if (nrow(range_checks) == 0) {
-        range_checks <- data.frame(note = "No numeric or numeric-like columns detected.")
-}
+if (nrow(range_checks)        == 0) range_checks        <- data.frame(note = "No numeric columns found.")
+if (nrow(numeric_parse_issues) == 0) numeric_parse_issues <- data.frame(note = "No numeric parse issues found.")
 
-if (nrow(numeric_parse_issues) == 0) {
-        numeric_parse_issues <- data.frame(note = "No numeric parsing issues detected.")
-}
-
-# =====================================================
-# 7. Price and discount specific checks
-# =====================================================
+# ---------------------------------------------------------------------------
+# C7. Price & discount sanity checks
+# ---------------------------------------------------------------------------
 
 price_discount_checks <- data.frame()
 
-if (!is.na(price_col)) {
-        
-        price_num <- parse_number(as.character(df[[price_col]]))
-        
-        price_discount_checks <- bind_rows(
-                price_discount_checks,
-                data.frame(
-                        check = "Price values that could not be parsed",
-                        count = sum(is.na(price_num) & !(is.na(df[[price_col]]) | df[[price_col]] == ""))
-                ),
-                data.frame(
-                        check = "Price values less than 0",
-                        count = sum(price_num < 0, na.rm = TRUE)
-                ),
-                data.frame(
-                        check = "Price values equal to 0",
-                        count = sum(price_num == 0, na.rm = TRUE)
+if (!is.na(detected$price)) {
+        p <- parse_number(as.character(df[[detected$price]]))
+        price_discount_checks <- bind_rows(price_discount_checks, data.frame(
+                check = c("Price: could not be parsed", "Price: < 0", "Price: == 0"),
+                count = c(
+                        sum(is.na(p) & !(is.na(df[[detected$price]]) | df[[detected$price]] == "")),
+                        sum(p < 0,  na.rm = TRUE),
+                        sum(p == 0, na.rm = TRUE)
                 )
-        )
+        ))
 }
 
-if (!is.na(discount_col)) {
-        
-        discount_num <- parse_number(as.character(df[[discount_col]]))
-        
-        price_discount_checks <- bind_rows(
-                price_discount_checks,
-                data.frame(
-                        check = "Discount values that could not be parsed",
-                        count = sum(is.na(discount_num) & !(is.na(df[[discount_col]]) | df[[discount_col]] == ""))
-                ),
-                data.frame(
-                        check = "Discount values less than 0",
-                        count = sum(discount_num < 0, na.rm = TRUE)
-                ),
-                data.frame(
-                        check = "Discount values greater than 100",
-                        count = sum(discount_num > 100, na.rm = TRUE)
+if (!is.na(detected$discount)) {
+        d <- parse_number(as.character(df[[detected$discount]]))
+        price_discount_checks <- bind_rows(price_discount_checks, data.frame(
+                check = c("Discount: could not be parsed", "Discount: < 0", "Discount: > 100"),
+                count = c(
+                        sum(is.na(d) & !(is.na(df[[detected$discount]]) | df[[detected$discount]] == "")),
+                        sum(d < 0,   na.rm = TRUE),
+                        sum(d > 100, na.rm = TRUE)
                 )
-        )
+        ))
 }
 
-if (nrow(price_discount_checks) == 0) {
+if (nrow(price_discount_checks) == 0)
         price_discount_checks <- data.frame(note = "No price or discount column detected.")
-}
 
-# =====================================================
-# 8. URL checks
-# =====================================================
+# ---------------------------------------------------------------------------
+# C8. URL validity checks
+# ---------------------------------------------------------------------------
 
-url_checks <- data.frame()
-
-check_url_column <- function(data, col_name, label) {
-        
+check_url_col <- function(col_name, label) {
         if (is.na(col_name)) {
                 return(data.frame(
-                        url_type = label,
-                        variable = NA,
-                        total_non_missing = NA,
-                        valid_url_count = NA,
-                        invalid_url_count = NA,
-                        duplicate_url_count = NA
+                        url_type = label, variable = NA,
+                        total_non_missing = NA, valid_count = NA,
+                        invalid_count = NA, duplicate_count = NA
                 ))
         }
-        
-        url_values <- as.character(data[[col_name]])
-        non_missing <- !(is.na(url_values) | url_values == "")
-        valid_url <- str_detect(url_values, "^https?://")
-        
+        v        <- as.character(df[[col_name]])
+        present  <- !(is.na(v) | v == "")
+        valid    <- str_detect(v, "^https?://")
         data.frame(
-                url_type = label,
-                variable = col_name,
-                total_non_missing = sum(non_missing),
-                valid_url_count = sum(valid_url & non_missing),
-                invalid_url_count = sum(!valid_url & non_missing),
-                duplicate_url_count = sum(duplicated(url_values) & non_missing)
+                url_type        = label,
+                variable        = col_name,
+                total_non_missing = sum(present),
+                valid_count     = sum(valid & present),
+                invalid_count   = sum(!valid & present),
+                duplicate_count = sum(duplicated(v) & present)
         )
 }
 
 url_checks <- bind_rows(
-        check_url_column(df, product_url_col, "Product URL"),
-        check_url_column(df, image_url_col, "Image URL")
+        check_url_col(detected$product_url, "Product URL"),
+        check_url_col(detected$image_url,   "Image URL")
 )
 
-# =====================================================
-# 9. Date and scrape time checks
-# =====================================================
+# ---------------------------------------------------------------------------
+# C9. Date / scrape-timestamp checks
+# ---------------------------------------------------------------------------
 
-datetime_checks <- data.frame()
-
-if (!is.na(scraped_at_col)) {
-        
-        scraped_values <- as.character(df[[scraped_at_col]])
-        
-        parsed_dates <- parse_date_time(
-                scraped_values,
-                orders = c(
-                        "ymd HMS",
-                        "ymd HM",
-                        "ymd",
-                        "mdy HMS",
-                        "mdy HM",
-                        "mdy",
-                        "dmy HMS",
-                        "dmy HM",
-                        "dmy"
-                ),
-                quiet = TRUE
-        )
-        
-        parsed_non_missing <- parsed_dates[!is.na(parsed_dates)]
+if (!is.na(detected$scraped_at)) {
+        raw_dates    <- as.character(df[[detected$scraped_at]])
+        parsed_dates <- parse_date_time(raw_dates, orders = DATE_ORDERS, quiet = TRUE)
+        non_missing  <- parsed_dates[!is.na(parsed_dates)]
         
         datetime_checks <- data.frame(
-                variable = scraped_at_col,
-                total_non_missing = sum(!(is.na(scraped_values) | scraped_values == "")),
-                parsed_date_count = sum(!is.na(parsed_dates)),
-                unparsed_date_count = sum(is.na(parsed_dates) & !(is.na(scraped_values) | scraped_values == "")),
-                earliest_date = if (length(parsed_non_missing) > 0) as.character(min(parsed_non_missing)) else NA,
-                latest_date = if (length(parsed_non_missing) > 0) as.character(max(parsed_non_missing)) else NA
+                variable          = detected$scraped_at,
+                total_non_missing = sum(!(is.na(raw_dates) | raw_dates == "")),
+                parsed_count      = sum(!is.na(parsed_dates)),
+                unparsed_count    = sum(is.na(parsed_dates) & !(is.na(raw_dates) | raw_dates == "")),
+                earliest_date     = if (length(non_missing) > 0) as.character(min(non_missing)) else NA,
+                latest_date       = if (length(non_missing) > 0) as.character(max(non_missing)) else NA
         )
-        
 } else {
-        datetime_checks <- data.frame(note = "No scraped date or timestamp column detected.")
+        datetime_checks <- data.frame(note = "No scraped date / timestamp column detected.")
 }
 
-# =====================================================
-# 10. Text quality checks
-# =====================================================
+# ---------------------------------------------------------------------------
+# C10. Text quality checks
+# ---------------------------------------------------------------------------
 
-character_columns <- names(df)[sapply(df, is.character)]
-
-text_quality_checks <- data.frame()
-
-# Function to clean text before checking it
 safe_text <- function(x) {
         x <- as.character(x)
-        
-        # Convert invalid text to UTF-8
-        x <- stringi::stri_enc_toutf8(x, is_unknown_8bit = TRUE)
-        
-        # Remove hidden/control characters that can break Excel or string checks
-        x <- stringi::stri_replace_all_regex(x, "\\p{C}", "")
-        
-        return(x)
+        x <- stri_enc_toutf8(x, is_unknown_8bit = TRUE)
+        stri_replace_all_regex(x, "\\p{C}", "")
 }
 
-for (col in character_columns) {
-        
+char_cols <- names(df)[sapply(df, is.character)]
+
+text_quality_checks <- map_dfr(char_cols, function(col) {
         x <- safe_text(df[[col]])
-        
-        temp <- data.frame(
-                variable = col,
-                blank_count = sum(x == "", na.rm = TRUE),
-                leading_or_trailing_space_count = sum(str_detect(x, "^\\s|\\s$"), na.rm = TRUE),
-                multiple_space_count = sum(str_detect(x, "\\s{2,}"), na.rm = TRUE),
-                contains_newline_count = sum(str_detect(x, "\\n|\\r"), na.rm = TRUE),
-                very_long_text_count = sum(str_length(x) > 200, na.rm = TRUE),
-                max_text_length = max(str_length(x), na.rm = TRUE),
-                unique_count = length(unique(x))
+        data.frame(
+                variable                     = col,
+                blank_count                  = sum(x == "",                        na.rm = TRUE),
+                leading_trailing_space_count = sum(str_detect(x, "^\\s|\\s$"),     na.rm = TRUE),
+                multiple_space_count         = sum(str_detect(x, "\\s{2,}"),       na.rm = TRUE),
+                newline_count                = sum(str_detect(x, "\\n|\\r"),       na.rm = TRUE),
+                very_long_text_count         = sum(str_length(x) > LONG_TEXT_THRESHOLD, na.rm = TRUE),
+                max_text_length              = max(str_length(x),                  na.rm = TRUE),
+                unique_count                 = length(unique(x))
         )
-        
-        text_quality_checks <- bind_rows(text_quality_checks, temp)
-}
+})
 
-if (nrow(text_quality_checks) == 0) {
+if (nrow(text_quality_checks) == 0)
         text_quality_checks <- data.frame(note = "No character columns detected.")
-}
 
-# =====================================================
-# 11. Category, color, size and material checks
-# =====================================================
+# ---------------------------------------------------------------------------
+# C11. Category / color / size / material level summaries
+# ---------------------------------------------------------------------------
 
-important_text_cols <- c(
-        category_col,
-        color_col,
-        size_col,
-        material_col
-)
+cat_cols <- Filter(Negate(is.na), c(
+        detected$category, detected$color, detected$size, detected$material
+))
 
-important_text_cols <- important_text_cols[!is.na(important_text_cols)]
-
-level_summary <- data.frame()
-
-for (col in important_text_cols) {
-        
-        temp <- data.frame(value = as.character(df[[col]])) %>%
+level_summary <- map_dfr(cat_cols, function(col) {
+        df %>%
+                transmute(value = as.character(.data[[col]])) %>%
                 filter(!(is.na(value) | value == "")) %>%
-                group_by(value) %>%
-                summarise(count = n(), .groups = "drop") %>%
-                arrange(desc(count)) %>%
+                count(value, sort = TRUE, name = "count") %>%
                 mutate(variable = col) %>%
-                select(variable, value, count)
-        
-        temp <- head(temp, 50)
-        
-        level_summary <- bind_rows(level_summary, temp)
-}
+                select(variable, value, count) %>%
+                head(EXCEL_SAMPLE_ROWS)
+})
 
-if (nrow(level_summary) == 0) {
-        level_summary <- data.frame(note = "No category, color, size, or material columns detected.")
-}
+if (nrow(level_summary) == 0)
+        level_summary <- data.frame(note = "No category / color / size / material columns detected.")
 
-# =====================================================
-# 12. Rows with possible issues
-# =====================================================
+# ---------------------------------------------------------------------------
+# C12. Problem-row flags
+# ---------------------------------------------------------------------------
 
 issue_flags <- data.frame(row_number = seq_len(nrow(df)))
 
-if (!is.na(price_col)) {
-        price_num <- parse_number(as.character(df[[price_col]]))
-        issue_flags$price_missing_or_invalid <- is.na(price_num)
-        issue_flags$price_negative <- price_num < 0
+if (!is.na(detected$price)) {
+        pn <- parse_number(as.character(df[[detected$price]]))
+        issue_flags$price_missing_or_invalid <- is.na(pn)
+        issue_flags$price_negative           <- !is.na(pn) & pn < 0
 }
 
-if (!is.na(discount_col)) {
-        discount_num <- parse_number(as.character(df[[discount_col]]))
-        issue_flags$discount_over_100 <- discount_num > 100
-        issue_flags$discount_negative <- discount_num < 0
+if (!is.na(detected$discount)) {
+        dn <- parse_number(as.character(df[[detected$discount]]))
+        issue_flags$discount_over_100 <- !is.na(dn) & dn > 100
+        issue_flags$discount_negative <- !is.na(dn) & dn < 0
 }
 
-if (!is.na(product_url_col)) {
-        product_url_values <- as.character(df[[product_url_col]])
-        issue_flags$product_url_invalid <- !str_detect(product_url_values, "^https?://") &
-                !(is.na(product_url_values) | product_url_values == "")
+flag_url_invalid <- function(col_name, flag_col) {
+        if (is.na(col_name)) return(NULL)
+        v <- as.character(df[[col_name]])
+        issue_flags[[flag_col]] <<- !str_detect(v, "^https?://") & !(is.na(v) | v == "")
 }
 
-if (!is.na(image_url_col)) {
-        image_url_values <- as.character(df[[image_url_col]])
-        issue_flags$image_url_invalid <- !str_detect(image_url_values, "^https?://") &
-                !(is.na(image_url_values) | image_url_values == "")
-}
+flag_url_invalid(detected$product_url, "product_url_invalid")
+flag_url_invalid(detected$image_url,   "image_url_invalid")
 
-issue_flags$issue_count <- rowSums(issue_flags[, setdiff(names(issue_flags), "row_number"), drop = FALSE], na.rm = TRUE)
+flag_cols <- setdiff(names(issue_flags), "row_number")
+issue_flags$issue_count <- rowSums(issue_flags[flag_cols], na.rm = TRUE)
 
-problem_row_numbers <- issue_flags$row_number[issue_flags$issue_count > 0]
+problem_rows <- head(df[issue_flags$row_number[issue_flags$issue_count > 0], ],
+                     100)
 
-problem_rows_sample <- df[problem_row_numbers, ]
-problem_rows_sample <- head(problem_rows_sample, 100)
+if (nrow(problem_rows) == 0)
+        problem_rows <- data.frame(note = "No problem rows flagged.")
 
-if (nrow(problem_rows_sample) == 0) {
-        problem_rows_sample <- data.frame(note = "No major problem rows flagged by the current checks.")
-}
+# =============================================================================
+# SECTION D — Write diagnostics workbook
+# =============================================================================
 
-# =====================================================
-# 13. Save diagnostics workbook
-# =====================================================
+message("[diagnosis] Writing diagnostics workbook ...")
 
 wb <- createWorkbook()
 
-add_sheet <- function(workbook, sheet_name, data) {
-        addWorksheet(workbook, sheet_name)
-        writeData(workbook, sheet_name, clean_df_for_excel(data))
-        setColWidths(workbook, sheet_name, cols = 1:ncol(data), widths = "auto")
-}
+add_sheet(wb, "01 Overview",              overview)
+add_sheet(wb, "02 Detected Columns",      detected_columns_tbl)
+add_sheet(wb, "03 Variable Types",        variable_types)
+add_sheet(wb, "04 Missingness Variable",  missingness_by_variable)
+add_sheet(wb, "05 Missingness Row",       missingness_by_row)
+add_sheet(wb, "06 Duplicate Summary",     duplicate_summary)
+add_sheet(wb, "07 Exact Dup Examples",    exact_dup_examples)
+add_sheet(wb, "08 Duplicate URL Exs",     dup_url_examples)
+add_sheet(wb, "09 Image URL Dup Summary", image_dup_summary)
+add_sheet(wb, "10 Range Checks",          range_checks)
+add_sheet(wb, "11 Numeric Parse Issues",  numeric_parse_issues)
+add_sheet(wb, "12 Price Discount Checks", price_discount_checks)
+add_sheet(wb, "13 URL Checks",            url_checks)
+add_sheet(wb, "14 Datetime Checks",       datetime_checks)
+add_sheet(wb, "15 Text Quality",          text_quality_checks)
+add_sheet(wb, "16 Level Summary",         level_summary)
+add_sheet(wb, "17 Desc Attr Names",       desc_attr_name_counts)
+add_sheet(wb, "18 Desc Attr Values",      desc_attr_value_counts)
+add_sheet(wb, "19 Desc Name-Value",       desc_name_value_counts)
+add_sheet(wb, "20 Problem Rows",          problem_rows)
 
-add_sheet(wb, "Overview", overview)
-add_sheet(wb, "Detected Columns", detected_columns)
-add_sheet(wb, "Description Attr Names", description_attribute_name_counts)
-add_sheet(wb, "Description Attr Values", description_attribute_value_counts)
-add_sheet(wb, "Description Name-Value", description_name_value_counts)
-add_sheet(wb, "Variable Types", variable_types)
-add_sheet(wb, "Missingness Variable", missingness_by_variable)
-add_sheet(wb, "Missingness Row", missingness_by_row_summary)
-add_sheet(wb, "Duplicate Summary", duplicate_summary)
-add_sheet(wb, "Exact Duplicate Examples", exact_duplicate_examples)
-add_sheet(wb, "Duplicate URL Examples", duplicate_product_url_examples)
-add_sheet(wb, "Range Checks", range_checks)
-add_sheet(wb, "Numeric Parse Issues", numeric_parse_issues)
-add_sheet(wb, "Price Discount Checks", price_discount_checks)
-add_sheet(wb, "URL Checks", url_checks)
-add_sheet(wb, "Datetime Checks", datetime_checks)
-add_sheet(wb, "Text Quality Checks", text_quality_checks)
-add_sheet(wb, "Top Levels", level_summary)
-add_sheet(wb, "Problem Rows Sample", problem_rows_sample)
+saveWorkbook(wb, DIAGNOSTICS_FILE, overwrite = TRUE)
 
-saveWorkbook(wb, output_file, overwrite = TRUE)
+message("[diagnosis] Workbook saved → ", DIAGNOSTICS_FILE)
 
-cat("Exploratory diagnostics created successfully.\n")
-cat("Saved to:", output_file, "\n")

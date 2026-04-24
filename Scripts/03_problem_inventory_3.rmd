@@ -1,0 +1,545 @@
+---
+title: "Data Quality Problem Inventory"
+subtitle: "Shein Dataset — Cleaning Report, Section 1"
+date: "`r format(Sys.time(), '%d %B %Y  ·  %H:%M')`"
+author: "Shein Data Pipeline"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: kate
+    df_print: paged
+params:
+  run_pipeline: true
+---
+
+```{css echo=FALSE}
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+body, p, li, td, th { font-family: 'IBM Plex Sans', sans-serif; font-size: 15px; color: #1a1a1a; line-height: 1.75; }
+h1, h2, h3, h4      { font-family: 'IBM Plex Sans', sans-serif; font-weight: 600; color: #0d0d0d; }
+h1 { font-size: 2rem;  border-bottom: 2px solid #e0e0e0; padding-bottom: .4rem; margin-top: 2rem; }
+h2 { font-size: 1.4rem; border-left: 3px solid #1a56db; padding-left: .65rem; margin-top: 2rem; }
+h3 { font-size: 1.1rem; color: #374151; margin-top: 1.5rem; }
+code, pre            { font-family: 'IBM Plex Mono', monospace; }
+
+.main-container { max-width: 1020px !important; padding: 0 2rem; }
+
+.alert-box    { border-radius: 6px; padding: .8rem 1.1rem; margin: 1rem 0; font-size: .9rem; }
+.alert-high   { background: #fff1f0; border-left: 4px solid #cf1322; color: #820014; }
+.alert-medium { background: #fffbe6; border-left: 4px solid #d48806; color: #614700; }
+.alert-low    { background: #f6ffed; border-left: 4px solid #52c41a; color: #135200; }
+.alert-info   { background: #e6f4ff; border-left: 4px solid #1677ff; color: #003eb3; }
+
+.issue-table        { width: 100%; border-collapse: collapse; font-size: .87rem; margin: 1rem 0; }
+.issue-table th     { background: #f5f5f5; font-weight: 600; text-align: left; padding: .55rem .8rem; border-bottom: 2px solid #d9d9d9; }
+.issue-table td     { padding: .5rem .8rem; border-bottom: 1px solid #f0f0f0; vertical-align: top; }
+.issue-table tr:hover { background: #fafafa; }
+
+.badge        { display: inline-block; border-radius: 4px; padding: 2px 8px; font-size: .78rem; font-weight: 600; letter-spacing: .02em; }
+.badge-high   { background: #fff1f0; color: #cf1322; border: 1px solid #ffa39e; }
+.badge-medium { background: #fffbe6; color: #d48806; border: 1px solid #ffe58f; }
+.badge-low    { background: #f6ffed; color: #389e0d; border: 1px solid #b7eb8f; }
+
+.metric-grid      { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 1.2rem 0; }
+.metric-card      { background: #fafafa; border: 1px solid #e8e8e8; border-radius: 8px; padding: 1rem 1.1rem; }
+.metric-card .lbl { font-size: .78rem; color: #8c8c8c; text-transform: uppercase; letter-spacing: .06em; margin-bottom: .2rem; }
+.metric-card .val { font-size: 1.65rem; font-weight: 600; color: #0d0d0d; line-height: 1.2; }
+.metric-card .sub { font-size: .78rem; color: #8c8c8c; margin-top: .15rem; }
+
+table.table thead th { background-color: #f5f5f5 !important; color: #374151; font-weight: 600; }
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r pipeline, include=FALSE}
+if (isTRUE(params$run_pipeline)) {
+  source("00_config.r")
+  source("01_ingest.r")
+  source("02_diagnosis.r")
+}
+```
+
+```{r libraries, include=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(knitr)
+  library(kableExtra)
+})
+```
+
+```{r helpers, include=FALSE}
+# ── Table renderer ─────────────────────────────────────────────────────────────
+kt <- function(data, cap = NULL) {
+  data |>
+    kable(caption = cap, format.args = list(big.mark = ",")) |>
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+      full_width = FALSE, position = "left", font_size = 13
+    )
+}
+
+# ── Inline HTML helpers ────────────────────────────────────────────────────────
+badge <- function(priority) {
+  cls <- switch(tolower(priority),
+    high = "badge-high", medium = "badge-medium", low = "badge-low", "badge-low")
+  sprintf('<span class="badge %s">%s</span>', cls, toupper(priority))
+}
+
+alert <- function(text, level = "info") {
+  cat(sprintf('\n<div class="alert-box alert-%s">%s</div>\n', level, text))
+}
+
+metric_card <- function(label, value, sub = NULL) {
+  sub_html <- if (!is.null(sub)) sprintf('<div class="sub">%s</div>', sub) else ""
+  sprintf(
+    '<div class="metric-card"><div class="lbl">%s</div><div class="val">%s</div>%s</div>',
+    label, value, sub_html
+  )
+}
+
+# ── Scalar helpers ─────────────────────────────────────────────────────────────
+get_count <- function(df, label) {
+  v <- df$count[df$check == label]
+  if (length(v) == 0 || is.na(v[1])) 0L else as.integer(v[1])
+}
+
+comma_n <- function(n) formatC(as.integer(n), format = "d", big.mark = ",")
+pct_fmt <- function(n, d) sprintf("%.1f%%", n / d * 100)
+```
+
+```{r precompute, include=FALSE}
+n_rows     <- nrow(df)
+n_cols     <- ncol(df) - 1  # exclude helper row_number column
+
+n_exact_dup   <- get_count(duplicate_summary, "Exact duplicate rows")
+n_dup_url     <- get_count(duplicate_summary, "Duplicate product URLs")
+n_dup_name    <- get_count(duplicate_summary, "Duplicate product names")
+n_dup_img_url <- get_count(duplicate_summary, "Duplicate image URLs")
+
+n_missing_any <- as.integer(
+  overview$value[overview$metric == "Rows with \u22651 missing value"]
+)
+
+high_missing_cols <- missingness_by_variable |>
+  filter(missing_pct >= 30) |> pull(variable)
+
+p_invalid  <- get_count(price_discount_checks, "Price: could not be parsed")
+p_neg      <- get_count(price_discount_checks, "Price: < 0")
+p_zero     <- get_count(price_discount_checks, "Price: == 0")
+d_invalid  <- get_count(price_discount_checks, "Discount: could not be parsed")
+d_over_100 <- get_count(price_discount_checks, "Discount: > 100")
+d_neg      <- get_count(price_discount_checks, "Discount: < 0")
+
+url_invalid_product <- if (!is.na(detected$product_url))
+  url_checks$invalid_count[url_checks$url_type == "Product URL"] else 0L
+url_invalid_image <- if (!is.na(detected$image_url))
+  url_checks$invalid_count[url_checks$url_type == "Image URL"] else 0L
+total_url_issues <- as.integer(url_invalid_product) + as.integer(url_invalid_image)
+
+img_dup_records <- if (exists("records_with_dup_images")) nrow(records_with_dup_images) else 0L
+img_dup_pct     <- round(img_dup_records / n_rows * 100, 1)
+
+n_parse_fail <- if (!"note" %in% names(numeric_parse_issues)) nrow(numeric_parse_issues) else 0L
+
+dt_unparsed <- if (!"note" %in% names(datetime_checks)) datetime_checks$unparsed_count[1] else 0L
+dt_earliest <- if (!"note" %in% names(datetime_checks)) datetime_checks$earliest_date[1] else NA
+dt_latest   <- if (!"note" %in% names(datetime_checks)) datetime_checks$latest_date[1]   else NA
+
+ws_issues <- text_quality_checks |>
+  filter(leading_trailing_space_count > 0) |>
+  summarise(total = sum(leading_trailing_space_count)) |> pull(total)
+
+newline_issues <- text_quality_checks |>
+  filter(newline_count > 0) |>
+  summarise(total = sum(newline_count)) |> pull(total)
+```
+
+---
+
+# Executive Summary
+
+```{r exec-cards, results='asis'}
+cat(paste0(
+  '<div class="metric-grid">',
+  metric_card("Total rows",            comma_n(n_rows)),
+  metric_card("Total columns",         comma_n(n_cols)),
+  metric_card("Exact duplicates",      comma_n(n_exact_dup),      pct_fmt(n_exact_dup, n_rows)),
+  metric_card("Rows missing \u22651 field", comma_n(n_missing_any), pct_fmt(n_missing_any, n_rows)),
+  metric_card("Price anomalies",       comma_n(p_invalid + p_neg + p_zero)),
+  metric_card("Image dup records",     comma_n(img_dup_records),   paste0(img_dup_pct, "% of rows")),
+  '</div>'
+))
+```
+
+This document catalogues every data quality issue found during the
+exploratory-diagnostics phase (`02_diagnosis.R`). Each entry carries a
+severity rating, an affected-record count, and a recommended cleaning action.
+These findings form the specification for `03_clean.R`.
+
+---
+
+# 1  Dataset Overview
+
+```{r overview}
+overview |> kt("Dataset at a glance")
+```
+
+```{r detected-cols}
+detected_columns_tbl |>
+  rename(`Expected field` = expected_field, `Detected column` = detected_column) |>
+  kt("Auto-detected columns by heuristic name matching")
+```
+
+---
+
+# 2  Problem Inventory
+
+## 2.1  Duplicate Records
+
+```{r dup-summary}
+duplicate_summary |> kt("Duplicate counts across key identifiers")
+```
+
+```{r dup-alerts, results='asis'}
+if (n_exact_dup > 0)
+  alert(paste0(
+    "<strong>High &mdash;</strong> ", comma_n(n_exact_dup), " exact duplicate rows (",
+    pct_fmt(n_exact_dup, n_rows), " of dataset). Byte-for-byte identical; ",
+    "remove with <code>distinct()</code> before any further analysis."
+  ), "high")
+
+if (n_dup_url > 0)
+  alert(paste0(
+    "<strong>High &mdash;</strong> ", comma_n(n_dup_url),
+    " rows share a product URL with at least one other row. ",
+    "Indicates multi-date scraping compiled without deduplication."
+  ), "high")
+```
+
+### Image URL duplication within product rows
+
+Images were scraped across multiple dates and merged without removing
+duplicate URLs from each product's comma-separated image list.
+
+```{r img-dup}
+image_dup_summary |> rename(Metric = metric, Value = value) |>
+  kt("Image URL duplication within product rows")
+```
+
+```{r img-dup-alert, results='asis'}
+alert(paste0(
+  "<strong>Medium &mdash;</strong> ", comma_n(img_dup_records), " records (",
+  img_dup_pct, "%) contain at least one duplicate image URL in the ",
+  "<code>images</code> field. De-duplicate per-row with ",
+  "<code>unique(strsplit(images, ',\\\\s*')[[1]])</code>."
+), "medium")
+```
+
+---
+
+## 2.2  Missingness
+
+```{r missingness}
+missingness_by_variable |>
+  filter(missing_count > 0) |>
+  select(variable, missing_count, non_missing, missing_pct) |>
+  rename(Variable = variable, `Missing (n)` = missing_count,
+         `Present (n)` = non_missing, `Missing (%)` = missing_pct) |>
+  kt("Columns with at least one missing value, ordered by severity")
+```
+
+```{r missing-alert, results='asis'}
+if (length(high_missing_cols) > 0) {
+  alert(paste0(
+    "<strong>Medium &mdash;</strong> ", length(high_missing_cols),
+    " column(s) exceed 30% missing: <strong>",
+    paste(high_missing_cols, collapse = ", "),
+    "</strong>. Decide per-column whether to impute, exclude, or document as structurally absent."
+  ), "medium")
+} else {
+  alert("No column exceeds 30% missing. Missingness is within acceptable bounds.", "low")
+}
+```
+
+### Missingness distribution across rows
+
+```{r missingness-row}
+missingness_by_row |>
+  rename(`Missing fields per row` = missing_values_per_row, `Row count` = row_count) |>
+  kt("Distribution of missing values across rows")
+```
+
+---
+
+## 2.3  Numeric Range & Outlier Checks
+
+```{r range}
+if ("note" %in% names(range_checks)) {
+  cat(range_checks$note)
+} else {
+  range_checks |>
+    select(variable, min, median, mean, max, negative_count, zero_count, iqr_outlier_count) |>
+    rename(Variable = variable, Min = min, Median = median, Mean = mean, Max = max,
+           `Neg (n)` = negative_count, `Zero (n)` = zero_count,
+           `IQR outliers` = iqr_outlier_count) |>
+    kt(paste0("Numeric summary — IQR multiplier = ", IQR_MULTIPLIER))
+}
+```
+
+```{r parse-fail, results='asis'}
+if (n_parse_fail > 0) {
+  alert(paste0(
+    "<strong>Medium &mdash;</strong> ", comma_n(n_parse_fail),
+    " cell(s) in numeric-like columns could not be coerced to a number. ",
+    "Review raw values and standardise format upstream."
+  ), "medium")
+  numeric_parse_issues |> head(20) |> kt("Numeric parse failures (first 20 shown)")
+} else {
+  alert("All numeric-like columns parsed without errors.", "low")
+}
+```
+
+---
+
+## 2.4  Price & Discount Issues
+
+```{r price-discount}
+price_discount_checks |> rename(Check = check, Count = count) |>
+  kt("Price and discount sanity checks")
+```
+
+```{r price-alert, results='asis'}
+issues_found <- c()
+if (p_invalid  > 0) issues_found <- c(issues_found, paste0(
+  "<strong>", comma_n(p_invalid), " price(s)</strong> could not be parsed &mdash; ",
+  "inspect for embedded currency symbols or free-text strings"))
+if (p_neg > 0) issues_found <- c(issues_found, paste0(
+  "<strong>", comma_n(p_neg), " price(s) are negative</strong> &mdash; ",
+  "likely a scraping or data-entry error"))
+if (p_zero > 0) issues_found <- c(issues_found, paste0(
+  "<strong>", comma_n(p_zero), " price(s) are zero</strong> &mdash; ",
+  "confirm whether free items or missing values"))
+if (d_invalid  > 0) issues_found <- c(issues_found, paste0(
+  "<strong>", comma_n(d_invalid), " discount(s)</strong> could not be parsed"))
+if (d_over_100 > 0) issues_found <- c(issues_found, paste0(
+  "<strong>", comma_n(d_over_100), " discount(s) exceed 100%</strong> &mdash; flag as invalid"))
+if (d_neg > 0) issues_found <- c(issues_found, paste0(
+  "<strong>", comma_n(d_neg), " discount(s) are negative</strong>"))
+
+if (length(issues_found) > 0) {
+  alert(paste0("Issues found:<ul><li>",
+    paste(issues_found, collapse = "</li><li>"), "</li></ul>"), "high")
+} else {
+  alert("No price or discount anomalies detected.", "low")
+}
+```
+
+---
+
+## 2.5  URL Validity
+
+```{r url-checks}
+url_checks |>
+  select(-variable) |>
+  rename(`URL type` = url_type, `Non-missing (n)` = total_non_missing,
+         `Valid (n)` = valid_count, `Invalid (n)` = invalid_count,
+         `Duplicate (n)` = duplicate_count) |>
+  kt("URL validity — valid = starts with http:// or https://")
+```
+
+```{r url-alert, results='asis'}
+if (total_url_issues > 0) {
+  alert(paste0(
+    "<strong>Medium &mdash;</strong> ", comma_n(total_url_issues),
+    " URL(s) do not start with <code>http(s)://</code> (product: ",
+    comma_n(url_invalid_product), ", image: ", comma_n(url_invalid_image),
+    "). These will fail if fetched programmatically."
+  ), "medium")
+} else {
+  alert("All non-missing URLs are well-formed.", "low")
+}
+```
+
+---
+
+## 2.6  Date & Timestamp Issues
+
+```{r datetime}
+datetime_checks |> kt("Scraped-at timestamp parsing results")
+```
+
+```{r datetime-alert, results='asis'}
+if (!"note" %in% names(datetime_checks)) {
+  if (!is.na(dt_unparsed) && dt_unparsed > 0) {
+    alert(paste0(
+      "<strong>Medium &mdash;</strong> ", comma_n(dt_unparsed),
+      " timestamp value(s) could not be parsed. ",
+      "Extend <code>DATE_ORDERS</code> in <code>00_config.R</code>."
+    ), "medium")
+  } else {
+    alert(paste0(
+      "All timestamps parsed successfully. Scrape window: <strong>",
+      dt_earliest, "</strong> &rarr; <strong>", dt_latest,
+      "</strong>. Data spans multiple scrape dates &mdash; ",
+      "deduplication should retain the latest record per product URL."
+    ), "info")
+  }
+} else {
+  alert("No scraped timestamp column detected in the raw file.", "medium")
+}
+```
+
+---
+
+## 2.7  Text Quality
+
+```{r text-quality}
+text_quality_checks |>
+  filter(blank_count > 0 | leading_trailing_space_count > 0 |
+           multiple_space_count > 0 | newline_count > 0) |>
+  select(variable, blank_count, leading_trailing_space_count,
+         multiple_space_count, newline_count, max_text_length) |>
+  rename(Variable = variable, `Blank (n)` = blank_count,
+         `Lead/trail space` = leading_trailing_space_count,
+         `Multi-space` = multiple_space_count,
+         `Newline (n)` = newline_count, `Max length` = max_text_length) |>
+  kt("Text quality flags — columns with at least one issue")
+```
+
+```{r text-alert, results='asis'}
+if (ws_issues > 0)
+  alert(paste0(
+    "<strong>Low &mdash;</strong> ", comma_n(ws_issues),
+    " cell(s) contain leading or trailing whitespace. ",
+    "Apply <code>str_squish()</code> across all character columns."
+  ), "low")
+if (newline_issues > 0)
+  alert(paste0(
+    "<strong>Low &mdash;</strong> ", comma_n(newline_issues),
+    " cell(s) contain embedded newlines. Replace with a space unless the field is intentionally multi-line."
+  ), "low")
+```
+
+---
+
+## 2.8  Categorical Level Summaries
+
+Top-50 most frequent values per field. Review for misspellings, encoding
+inconsistencies, and non-standard labels before any grouping or modelling.
+
+```{r levels}
+if (!"note" %in% names(level_summary)) {
+  level_summary |>
+    rename(Variable = variable, Value = value, Count = count) |>
+    head(80) |>
+    kt("Top values per categorical field (category / color / size / material)")
+} else {
+  cat(level_summary$note)
+}
+```
+
+---
+
+# 3  Consolidated Issue Register
+
+```{r issue-register, results='asis'}
+reg <- data.frame(
+  ID = c("S1","S2","D1","D2","D3","P1","P2","P3","P4",
+         "U1","T1","T2","DT1","I1"),
+  Category = c(
+    "Structure","Missingness","Duplicates","Duplicates","Duplicates",
+    "Price","Price","Price","Discount",
+    "URLs","Text","Text","Timestamps","Images"
+  ),
+  Description = c(
+    "Exact duplicate rows",
+    paste0(length(high_missing_cols), " column(s) exceed 30% missing"),
+    "Duplicate product URLs — multi-date scraping",
+    "Duplicate product names",
+    "Duplicate image URLs within product rows",
+    "Price values that could not be parsed",
+    "Prices equal to zero",
+    "Prices that are negative",
+    "Discounts exceeding 100%",
+    "URLs not starting with http(s)://",
+    "Leading / trailing whitespace",
+    "Embedded newline characters",
+    "Timestamp parsing failures",
+    "Multi-date scrape without deduplication"
+  ),
+  Affected = comma_n(c(
+    n_exact_dup, length(high_missing_cols),
+    n_dup_url, n_dup_name, img_dup_records,
+    p_invalid, p_zero, p_neg, d_over_100,
+    total_url_issues, ws_issues, newline_issues,
+    ifelse(is.na(dt_unparsed), 0L, as.integer(dt_unparsed)),
+    img_dup_records
+  )),
+  Priority = c(
+    "High","Medium","High","Medium","Medium",
+    "High","Medium","High","High",
+    "Medium","Low","Low","Medium","High"
+  ),
+  Action = c(
+    "distinct() after confirming no intentional repeats",
+    "Impute / exclude / document per-column",
+    "Sort scraped_at desc; distinct() on product_url",
+    "Review genuine variants vs. scraping artifacts",
+    "unique(strsplit(...)) row-wise on images column",
+    "Strip symbols, coerce; set NA if irrecoverable",
+    "Apply business rule: free item vs. missing",
+    "Set NA; flag for upstream source investigation",
+    "Cap at 100 or remove; flag as invalid",
+    "Attempt prefix repair; drop irrecoverable",
+    "str_squish() across all character columns",
+    "str_replace_all(x, '\\n|\\r', ' ')",
+    "Extend DATE_ORDERS in 00_config.R",
+    "Canonical scrape = latest per product URL"
+  ),
+  stringsAsFactors = FALSE
+)
+
+reg$Priority <- sapply(reg$Priority, badge)
+
+cat('<table class="issue-table">\n<thead><tr>')
+cat(paste0('<th>', names(reg), '</th>', collapse = ''))
+cat('</tr></thead>\n<tbody>\n')
+for (i in seq_len(nrow(reg))) {
+  cat('<tr>', paste0('<td>', as.character(reg[i, ]), '</td>', collapse = ''), '</tr>\n')
+}
+cat('</tbody></table>\n')
+```
+
+---
+
+# 4  Recommended Cleaning Sequence
+
+Apply cleaning steps in this order to prevent cascading effects:
+
+1. **Remove exact duplicates** (S1) — run first so all subsequent counts are accurate.
+2. **Resolve multi-date scraping duplicates** (D1, I1) — sort by `scraped_at` descending, then `distinct()` on the product URL key.
+3. **Standardise and coerce price / discount fields** (P1–P4) — strip currency symbols, cast to numeric, apply business rules.
+4. **Repair or remove malformed URLs** (U1) — attempt prefix repair; drop irrecoverable values.
+5. **Deduplicate per-product image URL lists** (D3) — `unique(strsplit(...))` row-wise.
+6. **Strip whitespace and embedded newlines** (T1, T2) — `str_squish()` + newline replacement across all character columns.
+7. **Apply per-column missingness strategy** (S2) — log each decision in the cleaning record.
+8. **Extend timestamp parser if needed** (DT1) — add formats to `DATE_ORDERS` in `00_config.R`.
+
+---
+
+<hr style="border:none; border-top:1px solid #e8e8e8; margin-top:3rem;">
+
+```{r session, results='asis'}
+cat(sprintf(
+  '<p style="font-size:.78rem;color:#8c8c8c;">R %s &nbsp;&middot;&nbsp; Report rendered %s</p>',
+  R.version$version.string,
+  format(Sys.time(), "%Y-%m-%d %H:%M %Z")
+))
+```
