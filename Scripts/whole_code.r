@@ -49,32 +49,32 @@ str(raw_file)
 summary(raw_file)
 
 
-###################Creating a small excel file sample to view data######################
-# dir.create("small_sample", showWarnings = FALSE)
-# 
-# # Take the first 50 rows
-# sample_50 <- raw_file[1:min(50, nrow(raw_file)), ]
-# 
-# # Fix invalid UTF-8 text in all character columns
-# sample_50 <- as.data.frame(
-#         lapply(sample_50, function(x) {
-#                 if (is.character(x)) {
-#                         x <- stri_enc_toutf8(x, is_unknown_8bit = TRUE)
-#                         x <- stri_replace_all_regex(x, "\\p{C}", "")
-#                 }
-#                 return(x)
-#         }),
-#         stringsAsFactors = FALSE
-# )
-# 
-# 
-# # write.xlsx(
-# #         sample_50,
-# #         file = "shein_sample_50_rows.xlsx",
-# #         overwrite = TRUE
-# # )
-# 
-# cat("First 50 rows saved successfully in the Output folder.")
+##################Creating a small excel file sample to view data######################
+dir.create("small_sample", showWarnings = FALSE)
+
+# Take the first 50 rows
+sample_50 <- raw_file[1:min(111189, nrow(raw_file)), ]
+
+# Fix invalid UTF-8 text in all character columns
+sample_50 <- as.data.frame(
+        lapply(sample_50, function(x) {
+                if (is.character(x)) {
+                        x <- stri_enc_toutf8(x, is_unknown_8bit = TRUE)
+                        x <- stri_replace_all_regex(x, "\\p{C}", "")
+                }
+                return(x)
+        }),
+        stringsAsFactors = FALSE
+)
+
+
+write.xlsx(
+        sample_50,
+        file = "shein_sample_50_rows.xlsx",
+        overwrite = TRUE
+)
+
+cat("First 50 rows saved successfully in the Output folder.")
 
 #02_diagnosis.r
 
