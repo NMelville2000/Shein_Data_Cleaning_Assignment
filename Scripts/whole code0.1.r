@@ -649,7 +649,7 @@ add_sheet(wb, "18 Desc Attr Values",      desc_attr_value_counts)
 add_sheet(wb, "19 Desc Name-Value",       desc_name_value_counts)
 add_sheet(wb, "20 Problem Rows",          problem_rows)
 
-saveWorkbook(wb, DIAGNOSTICS_FILE, overwrite = TRUE)
+#saveWorkbook(wb, DIAGNOSTICS_FILE, overwrite = TRUE)
 
-message("[diagnosis] Workbook saved → ", DIAGNOSTICS_FILE)
+#message("[diagnosis] Workbook saved → ", DIAGNOSTICS_FILE)
 
