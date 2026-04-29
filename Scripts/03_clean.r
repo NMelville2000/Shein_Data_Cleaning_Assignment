@@ -26,7 +26,7 @@ message("[clean] Starting 03_clean.r ...")
 # =============================================================================
 
 dc <- as.data.table(raw_file)
-setDT(dc)   # assert data.table class immediately, before any := operations
+setDT(dc)   # assert data.table class immediately,before any := operations
 
 # =============================================================================
 # SECTION B — Drop-log initialisation
