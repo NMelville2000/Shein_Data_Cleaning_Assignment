@@ -190,7 +190,7 @@ if ("size" %in% names(dc)) {
         
         # ── DETECT SIZE SYSTEM ──────────────────────────────────────────────
         dc[, size_system := fcase(
-                size == "one-size",                                              "one_size",
+                str_detect(str_trim(size), "^(one-size)(,\\s*one-size)*$"),     "one_size",
                 str_detect(size, "\\d+\\*\\d+"),                                "dimensions",
                 str_detect(size, "\\d{2}[A-G]\\(\\d{2}[A-G]"),                 "bra",
                 str_detect(size, "\\dY\\(|\\dY,|\\d{2}Y\\(|\\d{2}Y,|IN\\)"),  "kids",
