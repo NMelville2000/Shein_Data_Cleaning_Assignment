@@ -845,67 +845,143 @@ message("[clean] G — Size: classifying systems and extracting columns ...")
 
 if ("size" %in% names(dc)) {
         
-        # ── DETECT SIZE SYSTEM ──────────────────────────────────────────────
+        # ── STEP 1: NORMALISE SPACING ───────────────────────────────────────
+        # "XS (2),S (4)" and "XS(2),S(4)" are the same product but produce
+        # different classification results without this step.
+        dc[, size := str_squish(size)]                        # collapse internal spaces
+        dc[, size := str_replace_all(size, "\\s*\\(", "(")]   # "XS (2)" → "XS(2)"
+        dc[, size := str_replace_all(size, "\\s*,\\s*", ",")] # normalise comma spacing
+        
+        # ── STEP 2: MODIFIER FLAGS ──────────────────────────────────────────
+        # Multi-fit strings like "0(Petite XXS)-8/10(Petite L),12(0XL),14(1XL)"
+        # span petite + plus in one string. Extract modifier flags before the
+        # primary classification so the dominant system is classified correctly
+        # and the modifiers sit alongside it in the output.
+        dc[, has_petite := str_detect(size, "Petite")]
+        dc[, has_tall   := str_detect(size, "\\bTall\\b")]   # word boundary, not trailing space
+        dc[, has_plus   := str_detect(size, "0XL|1XL|2XL|3XL|4XL|5XL|6XL")]
+        
+        # ── STEP 3: REVISED CLASSIFICATION ORDER ────────────────────────────
         dc[, size_system := fcase(
-                size == "one-size",                                              "one_size",
-                str_detect(size, "\\d+\\*\\d+"),                                "dimensions",
-                str_detect(size, "\\d{2}[A-G]\\(\\d{2}[A-G]"),                 "bra",
-                str_detect(size, "\\dY\\(|\\dY,|\\d{2}Y\\(|\\d{2}Y,|IN\\)"),  "kids",
-                str_detect(size, "W\\d+ L\\d+"),                                "jeans",
-                str_detect(size, "CN\\d+|EUR\\d+"),                             "shoe_intl",
-                str_detect(size, "US\\d+\\.?\\d*") &
-                        !str_detect(size, "CN|EUR"),                            "shoe_us",
-                str_detect(size, "Petite"),                                     "petite",
-                str_detect(size, "Tall "),                                      "tall",
-                str_detect(size, "0XL|1XL|2XL|3XL|4XL|5XL|6XL"),              "plus",
-                str_detect(size, "[XSML]\\(\\d{2}\\)"),                        "eu_clothing",
-                str_detect(size, "^\\d"),                                       "us_letter",
-                str_detect(size, "(?i)ml|inch| m,| m$"),                       "volume_length",
-                str_detect(size, "\\bXXS\\b|\\bXS\\b|\\bS\\b|\\bM\\b|\\bL\\b|\\bXL\\b|\\bXXL\\b"),
-                "standard",
-                default =                                                        "unknown"
+                # 1. Exact matches first — safest
+                size == "one-size",                               "one_size",
+                size == "" | is.na(size),                         "missing",
+                
+                # 2. Unambiguous physical formats
+                str_detect(size, "\\d+\\*\\d+"),                  "dimensions",
+                
+                # 3. Shoe systems — check before anything with digits
+                str_detect(size, "CN\\d+"),                        "shoe_intl",
+                str_detect(size, "EUR\\d+") &
+                        !str_detect(size, "\\bXS\\b|\\bS\\b|\\bM\\b"),  "shoe_intl",
+                str_detect(size, "^US\\d+\\.?\\d*(,|$)"),          "shoe_us",
+                
+                # 4. Bra — requires band+cup pattern, extended cups included
+                str_detect(size, "\\d{2}[A-H]{1,2}\\(\\d{2}[A-H]{1,2}\\)"),  "bra",
+                
+                # 5. Kids
+                str_detect(size, "\\dY[,(]|\\d{2}Y[,(]|IN\\)"),   "kids",
+                
+                # 6. Jeans
+                str_detect(size, "W\\d+ L\\d+"),                   "jeans",
+                
+                # 7. Volume/length — BEFORE us_letter (1.5M starts with digit)
+                str_detect(size, "(?i)\\d+\\s*(ml|m,|m$| m,| m$)|\\d+\\s*inch"),  "volume_length",
+                
+                # 8. Plus
+                str_detect(size, "0XL|1XL|2XL|3XL|4XL|5XL|6XL"),  "plus",
+                
+                # 9. US clothing with numeric equivalents in parens
+                str_detect(size, "[A-Z]+\\(\\d"),                   "us_clothing",
+                
+                # 10. Numeric-first reverse format: 2(XS),4(S)
+                str_detect(size, "^\\d+\\s*\\([A-Z]"),              "us_clothing",
+                
+                # 11. EU clothing — broader: XS(34), XL(42), XXS(30), XXL(50)
+                str_detect(size, "[A-Z]+\\(\\d{2}\\)"),             "eu_clothing",
+                
+                # 12. Standard letter only
+                str_detect(size, "\\bXXS\\b|\\bXS\\b|\\bS\\b|\\bM\\b|\\bL\\b|\\bXL\\b|\\bXXL\\b"),  "standard",
+                
+                # 13. Starts with digit — now only reaches here if not volume/shoe/clothing
+                str_detect(size, "^\\d"),                           "us_letter",
+                
+                default =                                           "unknown"
         )]
         
-        # ── SIZE COLUMNS ────────────────────────────────────────────────────
+        # ── STEP 4: DERIVE STRUCTURED COLUMNS (VECTORISED) ─────────────────
+        # Initialise all derived columns as NA
+        dc[, `:=`(
+                dimensions_raw = NA_character_,
+                size_labels    = NA_character_,
+                size_us        = NA_character_,
+                size_eu        = NA_character_,
+                waist          = NA_character_,
+                inseam         = NA_character_
+        )]
         
-        dc[, dimensions_raw := fifelse(size_system == "dimensions", size, NA_character_)]
+        # Dimensions: keep the raw dimension string as-is
+        dc[size_system == "dimensions",
+           dimensions_raw := size]
         
-        NON_CLOTHING <- c("one_size", "dimensions", "bra", "kids", "jeans",
-                          "volume_length", "unknown")
+        # US clothing: extract letter labels and US numeric from "XS(2),S(4),M(6),L(8/10)"
+        dc[size_system == "us_clothing",
+           size_labels := str_extract_all(size, "[A-Z]+(?=\\()") |> sapply(paste, collapse = ", ")]
+        dc[size_system == "us_clothing",
+           size_us := str_extract_all(size, "(?<=\\()[0-9/]+(?=\\))") |> sapply(paste, collapse = ", ")]
         
-        extract_labels <- function(size_str, system) {
-                if (system %in% NON_CLOTHING) return(NA_character_)
-                if (system == "shoe_us") return(size_str)
-                if (system == "us_letter") {
-                        labels <- str_extract_all(size_str, "(?<=\\()[A-Za-z/ ]+(?=\\))")[[1]]
-                } else {
-                        labels <- str_extract_all(
-                                size_str,
-                                "[A-Za-z][A-Za-z ]*(?=\\s*\\(|,|$)"
-                        )[[1]]
-                }
-                if (length(labels) == 0) return(NA_character_)
-                paste(str_trim(labels), collapse = ", ")
-        }
+        # Standard: letters only
+        dc[size_system == "standard",
+           size_labels := size]
         
-        extract_us_sizes <- function(size_str, system) {
-                if (system %in% c(NON_CLOTHING, "shoe_us")) return(NA_character_)
-                if (system == "shoe_intl") {
-                        us <- str_extract_all(size_str, "(?<=US)[0-9.]+")[[1]]
-                        return(if (length(us) == 0) NA_character_ else paste(us, collapse = ", "))
-                }
-                nums <- str_extract_all(size_str, "(?<=\\()[0-9/]+(?=\\))")[[1]]
-                if (length(nums) == 0) return(NA_character_)
-                paste(nums, collapse = ", ")
-        }
+        # Plus: extract XL labels and numeric
+        dc[size_system == "plus",
+           size_labels := str_extract_all(size, "[0-9]+XL") |> sapply(paste, collapse = ", ")]
+        dc[size_system == "plus",
+           size_us := str_extract_all(size, "(?<=\\()[0-9]+(?=\\))") |> sapply(paste, collapse = ", ")]
         
-        dc[, size_labels := mapply(extract_labels,  size, size_system)]
-        dc[, size_us     := mapply(extract_us_sizes, size, size_system)]
+        # Shoe international: extract EU/CN and US equivalents
+        dc[size_system == "shoe_intl",
+           size_eu := str_extract_all(size, "(?<=EUR|CN)[0-9]+") |> sapply(paste, collapse = ", ")]
+        dc[size_system == "shoe_intl",
+           size_us := str_extract_all(size, "(?<=US)[0-9.]+") |> sapply(paste, collapse = ", ")]
         
+        # Shoe US: keep raw string as labels
+        dc[size_system == "shoe_us",
+           size_labels := size]
+        
+        # EU clothing: extract letter labels and EU numeric
+        dc[size_system == "eu_clothing",
+           size_labels := str_extract_all(size, "[A-Z]+(?=\\()") |> sapply(paste, collapse = ", ")]
+        dc[size_system == "eu_clothing",
+           size_eu := str_extract_all(size, "(?<=\\()[0-9]+(?=\\))") |> sapply(paste, collapse = ", ")]
+        
+        # Jeans: extract waist and inseam separately
+        dc[size_system == "jeans",
+           waist := str_extract(size, "(?<=W)\\d+")]
+        dc[size_system == "jeans",
+           inseam := str_extract(size, "(?<=L)\\d+")]
+        
+        # Kids: extract age
+        dc[size_system == "kids",
+           size_labels := str_extract_all(size, "\\d+Y") |> sapply(paste, collapse = ", ")]
+        
+        # US letter (numeric-first reverse): extract letter from parens
+        dc[size_system == "us_letter",
+           size_labels := str_extract_all(size, "(?<=\\()[A-Za-z/ ]+(?=\\))") |> sapply(paste, collapse = ", ")]
+        dc[size_system == "us_letter",
+           size_us := str_extract_all(size, "\\d+(?=\\()") |> sapply(paste, collapse = ", ")]
+        
+        # ── STEP 5: SIZE COUNT FIX ──────────────────────────────────────────
+        # Range notation like "S-XL" counts as 1 on comma split but covers
+        # multiple sizes. Mark range-notation rows as NA rather than silently
+        # undercounting.
         dc[, size_count := fcase(
                 size_system == "one_size",                              1L,
-                size_system %in% c("dimensions", "unknown",
-                                   "volume_length"),                    NA_integer_,
+                size_system == "missing",                               NA_integer_,
+                size_system == "dimensions",                            NA_integer_,
+                size_system == "volume_length",                         NA_integer_,
+                str_detect(size, "-") & !str_detect(size, "\\*"),       NA_integer_,
                 default = as.integer(lengths(str_split(size, ",")))
         )]
         
@@ -917,8 +993,10 @@ if ("size" %in% names(dc)) {
                 reason = paste0(
                         "Multi-value string spanning multiple size systems. ",
                         "Replaced by: size_system (classification), size_labels ",
-                        "(letter labels), size_us (US numeric), dimensions_raw ",
-                        "(bedding), size_count (option count). ",
+                        "(letter labels), size_us (US numeric), size_eu (EU numeric), ",
+                        "dimensions_raw (bedding), waist/inseam (jeans), ",
+                        "size_count (option count), has_petite/has_tall/has_plus ",
+                        "(modifier flags). ",
                         "Columns for non-applicable systems left NA intentionally ",
                         "to preserve one-file structure for imputation."
                 )
@@ -937,8 +1015,9 @@ message("[clean] H — Assembling final cleaned dataset ...")
 # Identify any remaining columns not yet handled (images etc.) — carry forward
 handled <- c("sku", "url", "name", "price", "price_flag",
              "brand", "color",
-             "size_system", "size_labels", "size_us",
-             "dimensions_raw", "size_count",
+             "size_system", "size_labels", "size_us", "size_eu",
+             "dimensions_raw", "waist", "inseam", "size_count",
+             "has_petite", "has_tall", "has_plus",
              "description", "size", "images")
 
 remaining <- setdiff(names(dc), handled)
@@ -946,8 +1025,10 @@ remaining <- setdiff(names(dc), handled)
 priority_cols <- intersect(
         c("sku", "url", "name", "price", "price_flag",
           "brand", "color",
-          "size_system", "size_count", "size_labels", "images", "size_us",
-          "dimensions_raw"),
+          "size_system", "size_count", "size_labels", "size_us", "size_eu",
+          "dimensions_raw", "waist", "inseam",
+          "has_petite", "has_tall", "has_plus",
+          "images"),
         names(dc)
 )
 
