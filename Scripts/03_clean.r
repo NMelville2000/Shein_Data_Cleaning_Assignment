@@ -1,5 +1,3 @@
-#03_clean.r
-
 # =============================================================================
 # 03_clean.R
 # Project:  Shein Data Quality Pipeline
@@ -14,10 +12,7 @@
 #           list is reused here if present.
 # =============================================================================
 
-if (!exists("raw_file"))  source("01_ingest.r")
-if (!exists("detected"))  source("02_diagnosis.r")
-
-dir.create(OUTPUT_DIR, showWarnings = FALSE)
+stopifnot(exists("raw_file"), exists("detected"))
 
 message("[clean] Starting 03_clean.r ...")
 
@@ -25,8 +20,7 @@ message("[clean] Starting 03_clean.r ...")
 # SECTION A — Working copy
 # =============================================================================
 
-dc <- as.data.table(raw_file)
-setDT(dc)   # assert data.table class immediately,before any := operations
+dc <- copy(raw_file)   # raw_file is already a data.table; copy() avoids reference aliasing
 
 # =============================================================================
 # SECTION B — Drop-log initialisation
@@ -63,7 +57,6 @@ if ("sku" %in% names(dc)) {
 
 n_before <- nrow(dc)
 dc <- unique(dc, by = "sku")
-setDT(dc)
 n_after  <- nrow(dc)
 
 message("[clean]   Rows before dedup: ", formatC(n_before, big.mark = ","))
@@ -83,7 +76,7 @@ price_col <- detected$price   # column name detected in 02_diagnosis
 if (!is.na(price_col) && price_col %in% names(dc)) {
         
         dc[, price_clean := as.numeric(str_replace_all(
-                get(price_col), "[^0-9.]", ""
+                dc[[price_col]], "[^0-9.]", ""
         ))]
         
         dc[, price_flag := fcase(
@@ -99,7 +92,7 @@ if (!is.na(price_col) && price_col %in% names(dc)) {
         
         # Replace original price column with cleaned numeric; log the action
         dc[, (price_col) := price_clean]
-        setnames(dc, price_col, "price")
+        if (price_col != "price") setnames(dc, price_col, "price")
         dc[, price_clean := NULL]
         
         log_drop(
@@ -147,10 +140,10 @@ desc_col <- "description"   # confirmed present in raw_file from 02_diagnosis
 
 if (desc_col %in% names(dc)) {
         
-        dc[, color := str_extract(
-                get(desc_col),
-                "(?<='Color':\\s')[^']+"
-        )]
+        # str_match with a capturing group handles zero or more spaces after
+        # the colon — the previous lookbehind (?<='Color':\\s') required
+        # exactly one space and silently missed no-space variants.
+        dc[, color := str_match(dc[[desc_col]], "'Color':\\s*'([^']+)")[, 2]]
         
         n_color_found   <- dc[!is.na(color), .N]
         n_color_missing <- dc[is.na(color),  .N]
@@ -350,17 +343,50 @@ if ("size" %in% names(dc)) {
 }
 
 # =============================================================================
-# SECTION H — Assemble final cleaned data.frame
+# SECTION H — Images (basic cleaning — dedup URLs, count)
+# =============================================================================
+# The images column is a raw scraped string with brackets, quotes, and
+# potential duplicate URLs. Clean it before carrying forward.
+
+message("[clean] H — Images: deduplicating URLs and counting ...")
+
+if ("images" %in% names(dc)) {
+        
+        dc[, images_clean := vapply(images, function(x) {
+                urls <- str_extract_all(x, "https://[^'\"\\]]+")[[1]]
+                paste(unique(urls), collapse = " | ")
+        }, character(1))]
+        
+        dc[, images_n := vapply(images_clean, function(x) {
+                length(str_split(x, " \\| ")[[1]])
+        }, integer(1))]
+        
+        dc[, images := NULL]
+        
+        log_drop(
+                column = "images",
+                action = "replaced",
+                reason = paste0(
+                        "Raw scraped string with brackets/quotes. Replaced by: ",
+                        "images_clean (deduplicated pipe-separated URLs), ",
+                        "images_n (count of unique image URLs per product)."
+                )
+        )
+}
+
+# =============================================================================
+# SECTION I — Assemble final cleaned data.frame
 # =============================================================================
 
-message("[clean] H — Assembling final cleaned dataset ...")
+message("[clean] I — Assembling final cleaned dataset ...")
 
-# Identify any remaining columns not yet handled (images etc.) — carry forward
+# Identify any remaining columns not yet handled — carry forward
 handled <- c("sku", "url", "name", "price", "price_flag",
              "brand", "color",
              "size_system", "size_labels", "size_us", "size_eu",
              "dimensions_raw", "waist", "inseam", "size_count",
              "has_petite", "has_tall", "has_plus",
+             "images_clean", "images_n",
              "description", "size", "images")
 
 remaining <- setdiff(names(dc), handled)
@@ -371,15 +397,14 @@ priority_cols <- intersect(
           "size_system", "size_count", "size_labels", "size_us", "size_eu",
           "dimensions_raw", "waist", "inseam",
           "has_petite", "has_tall", "has_plus",
-          "images"),
+          "images_n", "images_clean"),
         names(dc)
 )
 
 df_clean <- as.data.frame(dc[, c(priority_cols, remaining), with = FALSE])
 
-
 # =============================================================================
-# SECTION I — Summary & drop log
+# SECTION J — Summary & drop log
 # =============================================================================
 
 cat("\n=== [03_clean] Final Cleaned Dataset ===\n")
@@ -410,12 +435,12 @@ cat("\n=== Drop Log ===\n")
 print(clean_drop_log)
 
 # =============================================================================
-# SECTION J — Export
+# SECTION K — Export
 # =============================================================================
 
 CLEAN_FILE <- file.path(OUTPUT_DIR, "shein_cleaned.csv")
 
-write.csv(df_clean, CLEAN_FILE, row.names = FALSE, na = "")
+fwrite(df_clean, CLEAN_FILE, na = "")
 
 message("[clean] Cleaned data saved → ", CLEAN_FILE)
 

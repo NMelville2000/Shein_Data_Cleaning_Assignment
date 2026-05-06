@@ -23,7 +23,6 @@ suppressPackageStartupMessages({
         library(purrr)        # map / map2 functional helpers
         library(scales)       # formatting for output
         library(openxlsx)     # Excel workbook creation
-        
 })
 
 # -----------------------------------------------------------------------------
@@ -39,16 +38,18 @@ raw_file <- fread(
         quote    = "\""
 )
 
-raw_file <- as.data.frame(raw_file)
+
+# Keep as data.table — avoids unnecessary data.table → data.frame → data.table
+# round-trip. Diagnosis section converts to data.frame locally where dplyr needs it.
 
 # -----------------------------------------------------------------------------
 # 3. Structural validation
 # -----------------------------------------------------------------------------
 
 stopifnot(
-        "Ingested object is not a data.frame" = is.data.frame(raw_file),
-        "Ingested data.frame has no rows"     = nrow(raw_file) > 0,
-        "Ingested data.frame has no columns"  = ncol(raw_file) > 0
+        "Ingested object is not a data.table" = is.data.table(raw_file),
+        "Ingested data has no rows"           = nrow(raw_file) > 0,
+        "Ingested data has no columns"        = ncol(raw_file) > 0
 )
 
 message("[ingest] Raw data loaded successfully.")
@@ -64,5 +65,8 @@ message(paste0("           ", names(raw_file), collapse = "\n"))
 cat("\n--- head() ---\n");  print(head(raw_file, 3))
 cat("\n--- str() ---\n");   str(raw_file)
 cat("\n--- summary() ---\n"); print(summary(raw_file))
+
+
+
 
 

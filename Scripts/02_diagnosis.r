@@ -66,7 +66,9 @@ add_sheet <- function(wb, sheet_name, data) {
 # SECTION B — Setup: working copy & column mapping
 # =============================================================================
 
-df <- raw_file %>% mutate(row_number = row_number())
+# Convert to data.frame locally — dplyr verbs in diagnosis need data.frame;
+# raw_file stays as data.table for 03_clean downstream.
+df <- as.data.frame(raw_file) %>% mutate(row_number = row_number())
 
 # --- Detect expected columns by heuristic name patterns ---
 detected <- list(
@@ -162,11 +164,16 @@ desc_name_value_counts <- description_pairs %>%
 # C3. Variable types & structure
 # ---------------------------------------------------------------------------
 
+# Compute missing counts once — reused in C3 and C4
+.missing_counts     <- sapply(df, \(x) sum(is.na(x) | x == ""))
+.non_missing_counts <- nrow(df) - .missing_counts
+
+
 variable_types <- data.frame(
         variable          = names(df),
         r_type            = sapply(df, \(x) paste(class(x), collapse = ", ")),
-        non_missing_count = sapply(df, \(x) sum(!(is.na(x) | x == ""))),
-        missing_count     = sapply(df, \(x) sum(is.na(x)  | x == "")),
+        non_missing_count = .non_missing_counts,
+        missing_count     = .missing_counts,
         unique_count      = sapply(df, \(x) length(unique(x))),
         stringsAsFactors  = FALSE
 ) %>%
@@ -179,11 +186,9 @@ variable_types <- data.frame(
 
 missingness_by_variable <- data.frame(
         variable      = names(df),
-        missing_count = sapply(df, \(x) sum(is.na(x) | x == "")),
-        non_missing   = sapply(df, \(x) sum(!(is.na(x) | x == ""))),
-        missing_pct   = round(
-                sapply(df, \(x) sum(is.na(x) | x == "")) / nrow(df) * 100, 2
-        ),
+        missing_count = .missing_counts,
+        non_missing   = .non_missing_counts,
+        missing_pct   = round(.missing_counts / nrow(df) * 100, 2),
         stringsAsFactors = FALSE
 ) %>%
         arrange(desc(missing_pct))
@@ -232,25 +237,20 @@ if (!is.na(detected$product_url)) {
         dup_url_examples <- data.frame(note = "No product URL column detected.")
 }
 
-# Image URL duplication — explode comma-separated lists
+# Image URL duplication — check for within-record duplicate URLs
 message("[diagnosis] Checking image URL duplication ...")
 
-exploded_images <- df %>%
-        separate_rows(images, sep = ",\\s*") %>%
-        mutate(images = trimws(str_remove_all(images, "[\\[\\]']"))) %>%
-        filter(!is.na(images), images != "")
+# Vectorised check: does each record contain repeated image URLs?
+# Replaces the previous rowwise() approach which was very slow on 111k rows.
+# Also removed the separate_rows() explosion (exploded_images / image_url_counts)
+# because those objects were computed but never written to the workbook.
+.has_dup_images <- vapply(df$images, function(x) {
+        if (is.na(x) || x == "") return(FALSE)
+        urls <- trimws(str_remove_all(unlist(strsplit(x, ",\\s*")), "[\\[\\]']"))
+        length(urls) != length(unique(urls))
+}, logical(1))
 
-image_url_counts <- exploded_images %>%
-        count(images, sort = TRUE, name = "count")
-
-records_with_dup_images <- df %>%
-        rowwise() %>%
-        mutate(
-                url_list      = list(trimws(str_remove_all(unlist(strsplit(images, ",\\s*")), "[\\[\\]']"))),
-                has_duplicates = length(url_list) != length(unique(url_list))
-        ) %>%
-        ungroup() %>%
-        filter(has_duplicates)
+n_records_with_dup_images <- sum(.has_dup_images)
 
 image_dup_summary <- data.frame(
         metric = c(
@@ -258,8 +258,8 @@ image_dup_summary <- data.frame(
                 "Pct of total records"
         ),
         value = c(
-                nrow(records_with_dup_images),
-                paste0(round(nrow(records_with_dup_images) / nrow(df) * 100, 2), "%")
+                n_records_with_dup_images,
+                paste0(round(n_records_with_dup_images / nrow(df) * 100, 2), "%")
         )
 )
 
@@ -529,6 +529,3 @@ add_sheet(wb, "19 Desc Name-Value",       desc_name_value_counts)
 add_sheet(wb, "20 Problem Rows",          problem_rows)
 
 saveWorkbook(wb, DIAGNOSTICS_FILE, overwrite = TRUE)
-
-message("[diagnosis] Workbook saved → ", DIAGNOSTICS_FILE)
-

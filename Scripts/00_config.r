@@ -18,7 +18,7 @@ REPORT_FILE      <- file.path(OUTPUT_DIR, "shein_data_quality_report.html")
 # -----------------------------------------------------------------------------
 
 # Maximum rows written to Excel example sheets (keeps workbook manageable)
-EXCEL_SAMPLE_ROWS <- 50
+EXCEL_SAMPLE_ROWS <- 111189
 
 # IQR multiplier used for outlier flagging
 IQR_MULTIPLIER <- 1.5
@@ -52,3 +52,6 @@ if (!file.exists(RAW_FILE_PATH)) {
 }
 
 message("[config] Configuration loaded successfully.")
+
+# Create output directory once for all downstream scripts
+dir.create(OUTPUT_DIR, showWarnings = FALSE)
