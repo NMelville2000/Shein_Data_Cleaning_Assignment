@@ -53,6 +53,9 @@ if (!file.exists(RAW_FILE_PATH)) {
 
 message("[config] Configuration loaded successfully.")
 
+# Create output directory once for all downstream scripts
+dir.create(OUTPUT_DIR, showWarnings = FALSE)
+
 # =============================================================================
 # 01_ingest.R
 # Project:  Shein Data Quality Pipeline
@@ -93,16 +96,18 @@ raw_file <- fread(
         quote    = "\""
 )
 
-raw_file <- as.data.frame(raw_file)
+
+# Keep as data.table — avoids unnecessary data.table → data.frame → data.table
+# round-trip. Diagnosis section converts to data.frame locally where dplyr needs it.
 
 # -----------------------------------------------------------------------------
 # 3. Structural validation
 # -----------------------------------------------------------------------------
 
 stopifnot(
-        "Ingested object is not a data.frame" = is.data.frame(raw_file),
-        "Ingested data.frame has no rows"     = nrow(raw_file) > 0,
-        "Ingested data.frame has no columns"  = ncol(raw_file) > 0
+        "Ingested object is not a data.table" = is.data.table(raw_file),
+        "Ingested data has no rows"           = nrow(raw_file) > 0,
+        "Ingested data has no columns"        = ncol(raw_file) > 0
 )
 
 message("[ingest] Raw data loaded successfully.")
@@ -189,7 +194,9 @@ add_sheet <- function(wb, sheet_name, data) {
 # SECTION B — Setup: working copy & column mapping
 # =============================================================================
 
-df <- raw_file %>% mutate(row_number = row_number())
+# Convert to data.frame locally — dplyr verbs in diagnosis need data.frame;
+# raw_file stays as data.table for 03_clean downstream.
+df <- as.data.frame(raw_file) %>% mutate(row_number = row_number())
 
 # --- Detect expected columns by heuristic name patterns ---
 detected <- list(
@@ -285,11 +292,16 @@ desc_name_value_counts <- description_pairs %>%
 # C3. Variable types & structure
 # ---------------------------------------------------------------------------
 
+# Compute missing counts once — reused in C3 and C4
+.missing_counts     <- sapply(df, \(x) sum(is.na(x) | x == ""))
+.non_missing_counts <- nrow(df) - .missing_counts
+
+
 variable_types <- data.frame(
         variable          = names(df),
         r_type            = sapply(df, \(x) paste(class(x), collapse = ", ")),
-        non_missing_count = sapply(df, \(x) sum(!(is.na(x) | x == ""))),
-        missing_count     = sapply(df, \(x) sum(is.na(x)  | x == "")),
+        non_missing_count = .non_missing_counts,
+        missing_count     = .missing_counts,
         unique_count      = sapply(df, \(x) length(unique(x))),
         stringsAsFactors  = FALSE
 ) %>%
@@ -302,11 +314,9 @@ variable_types <- data.frame(
 
 missingness_by_variable <- data.frame(
         variable      = names(df),
-        missing_count = sapply(df, \(x) sum(is.na(x) | x == "")),
-        non_missing   = sapply(df, \(x) sum(!(is.na(x) | x == ""))),
-        missing_pct   = round(
-                sapply(df, \(x) sum(is.na(x) | x == "")) / nrow(df) * 100, 2
-        ),
+        missing_count = .missing_counts,
+        non_missing   = .non_missing_counts,
+        missing_pct   = round(.missing_counts / nrow(df) * 100, 2),
         stringsAsFactors = FALSE
 ) %>%
         arrange(desc(missing_pct))
@@ -355,25 +365,20 @@ if (!is.na(detected$product_url)) {
         dup_url_examples <- data.frame(note = "No product URL column detected.")
 }
 
-# Image URL duplication — explode comma-separated lists
+# Image URL duplication — check for within-record duplicate URLs
 message("[diagnosis] Checking image URL duplication ...")
 
-exploded_images <- df %>%
-        separate_rows(images, sep = ",\\s*") %>%
-        mutate(images = trimws(str_remove_all(images, "[\\[\\]']"))) %>%
-        filter(!is.na(images), images != "")
+# Vectorised check: does each record contain repeated image URLs?
+# Replaces the previous rowwise() approach which was very slow on 111k rows.
+# Also removed the separate_rows() explosion (exploded_images / image_url_counts)
+# because those objects were computed but never written to the workbook.
+.has_dup_images <- vapply(df$images, function(x) {
+        if (is.na(x) || x == "") return(FALSE)
+        urls <- trimws(str_remove_all(unlist(strsplit(x, ",\\s*")), "[\\[\\]']"))
+        length(urls) != length(unique(urls))
+}, logical(1))
 
-image_url_counts <- exploded_images %>%
-        count(images, sort = TRUE, name = "count")
-
-records_with_dup_images <- df %>%
-        rowwise() %>%
-        mutate(
-                url_list      = list(trimws(str_remove_all(unlist(strsplit(images, ",\\s*")), "[\\[\\]']"))),
-                has_duplicates = length(url_list) != length(unique(url_list))
-        ) %>%
-        ungroup() %>%
-        filter(has_duplicates)
+n_records_with_dup_images <- sum(.has_dup_images)
 
 image_dup_summary <- data.frame(
         metric = c(
@@ -381,8 +386,8 @@ image_dup_summary <- data.frame(
                 "Pct of total records"
         ),
         value = c(
-                nrow(records_with_dup_images),
-                paste0(round(nrow(records_with_dup_images) / nrow(df) * 100, 2), "%")
+                n_records_with_dup_images,
+                paste0(round(n_records_with_dup_images / nrow(df) * 100, 2), "%")
         )
 )
 
@@ -671,10 +676,7 @@ saveWorkbook(wb, DIAGNOSTICS_FILE, overwrite = TRUE)
 #           list is reused here if present.
 # =============================================================================
 
-if (!exists("raw_file"))  source("01_ingest.r")
-if (!exists("detected"))  source("02_diagnosis.r")
-
-dir.create(OUTPUT_DIR, showWarnings = FALSE)
+stopifnot(exists("raw_file"), exists("detected"))
 
 message("[clean] Starting 03_clean.r ...")
 
@@ -682,8 +684,7 @@ message("[clean] Starting 03_clean.r ...")
 # SECTION A — Working copy
 # =============================================================================
 
-dc <- as.data.table(raw_file)
-setDT(dc)   # assert data.table class immediately,before any := operations
+dc <- copy(raw_file)   # raw_file is already a data.table; copy() avoids reference aliasing
 
 # =============================================================================
 # SECTION B — Drop-log initialisation
@@ -720,7 +721,6 @@ if ("sku" %in% names(dc)) {
 
 n_before <- nrow(dc)
 dc <- unique(dc, by = "sku")
-setDT(dc)
 n_after  <- nrow(dc)
 
 message("[clean]   Rows before dedup: ", formatC(n_before, big.mark = ","))
@@ -740,7 +740,7 @@ price_col <- detected$price   # column name detected in 02_diagnosis
 if (!is.na(price_col) && price_col %in% names(dc)) {
         
         dc[, price_clean := as.numeric(str_replace_all(
-                get(price_col), "[^0-9.]", ""
+                dc[[price_col]], "[^0-9.]", ""
         ))]
         
         dc[, price_flag := fcase(
@@ -756,7 +756,7 @@ if (!is.na(price_col) && price_col %in% names(dc)) {
         
         # Replace original price column with cleaned numeric; log the action
         dc[, (price_col) := price_clean]
-        setnames(dc, price_col, "price")
+        if (price_col != "price") setnames(dc, price_col, "price")
         dc[, price_clean := NULL]
         
         log_drop(
@@ -804,10 +804,10 @@ desc_col <- "description"   # confirmed present in raw_file from 02_diagnosis
 
 if (desc_col %in% names(dc)) {
         
-        dc[, color := str_extract(
-                get(desc_col),
-                "(?<='Color':\\s')[^']+"
-        )]
+        # str_match with a capturing group handles zero or more spaces after
+        # the colon — the previous lookbehind (?<='Color':\\s') required
+        # exactly one space and silently missed no-space variants.
+        dc[, color := str_match(dc[[desc_col]], "'Color':\\s*'([^']+)")[, 2]]
         
         n_color_found   <- dc[!is.na(color), .N]
         n_color_missing <- dc[is.na(color),  .N]
@@ -1007,17 +1007,50 @@ if ("size" %in% names(dc)) {
 }
 
 # =============================================================================
-# SECTION H — Assemble final cleaned data.frame
+# SECTION H — Images (basic cleaning — dedup URLs, count)
+# =============================================================================
+# The images column is a raw scraped string with brackets, quotes, and
+# potential duplicate URLs. Clean it before carrying forward.
+
+message("[clean] H — Images: deduplicating URLs and counting ...")
+
+if ("images" %in% names(dc)) {
+        
+        dc[, images_clean := vapply(images, function(x) {
+                urls <- str_extract_all(x, "https://[^'\"\\]]+")[[1]]
+                paste(unique(urls), collapse = " | ")
+        }, character(1))]
+        
+        dc[, images_n := vapply(images_clean, function(x) {
+                length(str_split(x, " \\| ")[[1]])
+        }, integer(1))]
+        
+        dc[, images := NULL]
+        
+        log_drop(
+                column = "images",
+                action = "replaced",
+                reason = paste0(
+                        "Raw scraped string with brackets/quotes. Replaced by: ",
+                        "images_clean (deduplicated pipe-separated URLs), ",
+                        "images_n (count of unique image URLs per product)."
+                )
+        )
+}
+
+# =============================================================================
+# SECTION I — Assemble final cleaned data.frame
 # =============================================================================
 
-message("[clean] H — Assembling final cleaned dataset ...")
+message("[clean] I — Assembling final cleaned dataset ...")
 
-# Identify any remaining columns not yet handled (images etc.) — carry forward
+# Identify any remaining columns not yet handled — carry forward
 handled <- c("sku", "url", "name", "price", "price_flag",
              "brand", "color",
              "size_system", "size_labels", "size_us", "size_eu",
              "dimensions_raw", "waist", "inseam", "size_count",
              "has_petite", "has_tall", "has_plus",
+             "images_clean", "images_n",
              "description", "size", "images")
 
 remaining <- setdiff(names(dc), handled)
@@ -1028,14 +1061,14 @@ priority_cols <- intersect(
           "size_system", "size_count", "size_labels", "size_us", "size_eu",
           "dimensions_raw", "waist", "inseam",
           "has_petite", "has_tall", "has_plus",
-          "images"),
+          "images_n", "images_clean"),
         names(dc)
 )
 
 df_clean <- as.data.frame(dc[, c(priority_cols, remaining), with = FALSE])
 
 # =============================================================================
-# SECTION I — Summary & drop log
+# SECTION J — Summary & drop log
 # =============================================================================
 
 cat("\n=== [03_clean] Final Cleaned Dataset ===\n")
@@ -1066,12 +1099,672 @@ cat("\n=== Drop Log ===\n")
 print(clean_drop_log)
 
 # =============================================================================
-# SECTION J — Export
+# SECTION K — Export
 # =============================================================================
 
 CLEAN_FILE <- file.path(OUTPUT_DIR, "shein_cleaned.csv")
 
-write.csv(df_clean, CLEAN_FILE, row.names = FALSE, na = "")
+fwrite(df_clean, CLEAN_FILE, na = "")
 
 message("[clean] Cleaned data saved → ", CLEAN_FILE)
+
+# =============================================================================
+# 04_impute.R
+# Project:  Shein Data Quality Pipeline
+# Purpose:  Impute missing prices in the cleaned dataset produced by 03_clean.R.
+#
+# Method:   MEDIAN IMPUTATION (grouped by size_system)
+#
+# Justification:
+#   Retail product prices are typically right-skewed — a mass of low-priced
+#   items with a long tail of expensive products.  The mean is pulled upward
+#   by that tail, so substituting it would systematically over-estimate the
+#   "typical" price for the missing rows.  The median resists this pull and
+#   gives a more representative central value.
+#
+#   Grouping by size_system further improves accuracy: bedding (dimensions),
+#   shoes, and clothing occupy different price bands, so a global median
+#   would blur those differences.  Where a size_system group has no observed
+#   prices to compute a median, the script falls back to the global median
+#   so that no row is left unimputed.
+#
+#   Hot-deck was considered but adds stochastic variation that is harder to
+#   reproduce and justify in a student report.  Mode imputation is designed
+#   for categorical variables, not continuous prices.  Mean imputation is
+#   inappropriate given the expected skew.  Constant/flag imputation (e.g.
+#   filling with 0 or "Unknown") would distort any downstream numeric
+#   analysis.  Leaving prices missing was rejected because price is a core
+#   analytic variable and the missingness rate, while low, would propagate
+#   NAs through every price-dependent calculation.
+#
+# Input:    df_clean   (data.frame from 03_clean.R, must exist in environment)
+# Output:   df_imputed (data.frame with price imputed)
+#           impute_log (data.frame documenting every imputation action)
+#           Output/shein_imputed.csv
+# Depends:  00_config.R + 01_ingest.R + 02_diagnosis.R + 03_clean.R
+# =============================================================================
+
+if (!exists("df_clean")) source("03_clean.r")
+
+dir.create(OUTPUT_DIR, showWarnings = FALSE)
+
+message("[impute] Starting 04_impute.r ...")
+
+# =============================================================================
+# SECTION A — Working copy
+# =============================================================================
+
+di <- as.data.table(df_clean)
+setDT(di)
+
+# =============================================================================
+# SECTION B — Imputation log initialisation
+# =============================================================================
+
+impute_log <- data.frame(
+        variable      = character(),
+        method        = character(),
+        group         = character(),
+        fill_value    = character(),
+        rows_imputed  = integer(),
+        reason        = character(),
+        stringsAsFactors = FALSE
+)
+
+log_impute <- function(variable, method, group, fill_value, rows_imputed, reason) {
+        impute_log <<- rbind(
+                impute_log,
+                data.frame(
+                        variable     = variable,
+                        method       = method,
+                        group        = group,
+                        fill_value   = as.character(fill_value),
+                        rows_imputed = as.integer(rows_imputed),
+                        reason       = reason,
+                        stringsAsFactors = FALSE
+                )
+        )
+}
+
+# =============================================================================
+# SECTION C — Identify rows needing price imputation
+# =============================================================================
+
+message("[impute] C — Identifying missing prices ...")
+
+# Rows flagged as "missing" by 03_clean's price_flag column are the
+# imputation targets.  Rows flagged "invalid" (price <= 0) are also
+# candidates — a zero or negative scraped price is not meaningful.
+
+if ("price_flag" %in% names(di)) {
+        needs_impute <- di$price_flag %in% c("missing", "invalid")
+} else {
+        # Fallback: treat NA prices as needing imputation
+        needs_impute <- is.na(di$price)
+}
+
+n_missing <- sum(needs_impute)
+message("[impute]   Rows requiring price imputation: ", n_missing,
+        " out of ", nrow(di))
+
+# =============================================================================
+# SECTION D — Pre-imputation diagnostics
+# =============================================================================
+
+message("[impute] D — Pre-imputation price distribution ...")
+
+valid_prices <- di[!needs_impute, price]
+valid_prices <- valid_prices[!is.na(valid_prices) & valid_prices > 0]
+
+if (length(valid_prices) > 0) {
+        global_median <- median(valid_prices)
+        global_mean   <- mean(valid_prices)
+        
+        cat("\n=== Pre-Imputation Price Summary (valid rows only) ===\n")
+        cat("  N valid:    ", length(valid_prices), "\n")
+        cat("  Min:        ", round(min(valid_prices), 2), "\n")
+        cat("  Q1:         ", round(quantile(valid_prices, 0.25), 2), "\n")
+        cat("  Median:     ", round(global_median, 2), "\n")
+        cat("  Mean:       ", round(global_mean, 2), "\n")
+        cat("  Q3:         ", round(quantile(valid_prices, 0.75), 2), "\n")
+        cat("  Max:        ", round(max(valid_prices), 2), "\n")
+        cat("  Mean − Median = ", round(global_mean - global_median, 2),
+            "  (positive → right skew, confirming median choice)\n\n")
+} else {
+        global_median <- NA_real_
+        warning("[impute] No valid prices found — cannot compute imputation values.")
+}
+
+# =============================================================================
+# SECTION E — Grouped median imputation (by size_system)
+# =============================================================================
+# Strategy:
+#   1. Compute median price per size_system from the valid (non-missing) rows.
+#   2. For each missing-price row, fill with the group median.
+#   3. If a group has zero valid prices, fall back to the global median.
+#   4. Log every group's fill value and row count.
+
+message("[impute] E — Applying grouped median imputation ...")
+
+if (n_missing > 0 && !is.na(global_median)) {
+        
+        # ── Step 1: group medians ───────────────────────────────────────────
+        
+        group_col <- "size_system"
+        
+        if (group_col %in% names(di)) {
+                
+                group_medians <- di[!needs_impute & !is.na(price) & price > 0,
+                                    .(group_median = median(price)),
+                                    by = size_system]
+                
+                cat("=== Group Medians (by size_system) ===\n")
+                print(group_medians[order(-group_median)])
+                cat("\n")
+                
+                # ── Step 2: merge group medians onto the full table ─────────
+                
+                di <- merge(di, group_medians, by = "size_system", all.x = TRUE, sort = FALSE)
+                
+                # ── Step 3: impute — group median first, global fallback ────
+                
+                di[needs_impute,
+                   price_imputed := fifelse(
+                           !is.na(group_median),
+                           group_median,
+                           global_median
+                   )]
+                
+                di[!needs_impute, price_imputed := price]
+                
+                # ── Step 4: log each group's contribution ───────────────────
+                
+                imputed_rows <- di[needs_impute]
+                
+                if (nrow(imputed_rows) > 0) {
+                        group_counts <- imputed_rows[, .N, by = size_system]
+                        
+                        for (i in seq_len(nrow(group_counts))) {
+                                grp  <- group_counts$size_system[i]
+                                cnt  <- group_counts$N[i]
+                                gmed <- group_medians[size_system == grp, group_median]
+                                
+                                if (length(gmed) == 0 || is.na(gmed)) {
+                                        fill_val <- global_median
+                                        note     <- "No valid prices in group; used global median fallback"
+                                } else {
+                                        fill_val <- gmed
+                                        note     <- "Group median applied"
+                                }
+                                
+                                log_impute(
+                                        variable     = "price",
+                                        method       = "median",
+                                        group        = grp,
+                                        fill_value   = round(fill_val, 2),
+                                        rows_imputed = cnt,
+                                        reason       = note
+                                )
+                        }
+                }
+                
+                # ── Step 5: replace price with imputed values, clean up ─────
+                
+                di[, price := price_imputed]
+                di[, c("group_median", "price_imputed") := NULL]
+                
+                # Update price_flag for imputed rows
+                di[needs_impute, price_flag := "imputed"]
+                
+        } else {
+                # No size_system column — fall back to ungrouped global median
+                
+                di[needs_impute, price := global_median]
+                di[needs_impute, price_flag := "imputed"]
+                
+                log_impute(
+                        variable     = "price",
+                        method       = "median",
+                        group        = "(global — no size_system column)",
+                        fill_value   = round(global_median, 2),
+                        rows_imputed = n_missing,
+                        reason       = "Global median; size_system not available for grouping"
+                )
+        }
+        
+} else if (n_missing == 0) {
+        message("[impute]   No missing prices — nothing to impute.")
+        log_impute(
+                variable     = "price",
+                method       = "none",
+                group        = "—",
+                fill_value   = "—",
+                rows_imputed = 0L,
+                reason       = "No missing prices detected; imputation not required"
+        )
+} else {
+        warning("[impute] Cannot impute — no valid reference prices available.")
+}
+
+# =============================================================================
+# SECTION F — Post-imputation diagnostics
+# =============================================================================
+
+message("[impute] F — Post-imputation summary ...")
+
+all_prices <- di[!is.na(price) & price > 0, price]
+
+if (length(all_prices) > 0) {
+        cat("\n=== Post-Imputation Price Summary ===\n")
+        cat("  N total:    ", length(all_prices), "\n")
+        cat("  Min:        ", round(min(all_prices), 2), "\n")
+        cat("  Q1:         ", round(quantile(all_prices, 0.25), 2), "\n")
+        cat("  Median:     ", round(median(all_prices), 2), "\n")
+        cat("  Mean:       ", round(mean(all_prices), 2), "\n")
+        cat("  Q3:         ", round(quantile(all_prices, 0.75), 2), "\n")
+        cat("  Max:        ", round(max(all_prices), 2), "\n")
+        cat("  Remaining NAs: ", sum(is.na(di$price)), "\n\n")
+}
+
+cat("=== Price Flag Distribution (post-imputation) ===\n")
+if ("price_flag" %in% names(di)) {
+        print(di[, .N, by = price_flag][order(-N)])
+}
+
+# =============================================================================
+# SECTION G — Assemble imputed output
+# =============================================================================
+
+message("[impute] G — Assembling final imputed dataset ...")
+
+df_imputed <- as.data.frame(di)
+
+# =============================================================================
+# SECTION H — Summary & imputation log
+# =============================================================================
+
+cat("\n=== [04_impute] Final Imputed Dataset ===\n")
+cat("Rows:   ", formatC(nrow(df_imputed), big.mark = ","), "\n")
+cat("Columns:", ncol(df_imputed), "\n\n")
+
+cat("=== Imputation Log ===\n")
+print(impute_log)
+
+cat("\n=== Missing Value Counts (post-imputation) ===\n")
+missing_summary <- sort(
+        sapply(df_imputed, function(x) sum(is.na(x) | x == "")),
+        decreasing = TRUE
+)
+print(missing_summary)
+
+# =============================================================================
+# SECTION I — Export
+# =============================================================================
+
+IMPUTED_FILE <- file.path(OUTPUT_DIR, "shein_imputed.csv")
+
+write.csv(df_imputed, IMPUTED_FILE, row.names = FALSE, na = "")
+
+message("[impute] Imputed data saved → ", IMPUTED_FILE)
+
+# =============================================================================
+# 04.1_charts.r
+# Project:  Shein Data Quality Pipeline
+# Purpose:  Generate four report-ready charts from the cleaned and imputed
+#           dataset, using a consistent visual theme.
+#
+# Charts:
+#   1. Missingness overview — % missing by variable, before vs. after cleaning
+#   2. Price distribution   — histogram of cleaned prices (numeric variable 1)
+#   3. Size count distribution — bar chart of size option counts (numeric var 2)
+#   4. Observed vs. imputed — price comparison for the imputed variable
+#   5. Price by size system — substantive insight chart
+#
+# Output:   Output/chart_1_missingness.png
+#           Output/chart_2_price_distribution.png
+#           Output/chart_3_size_count_distribution.png
+#           Output/chart_4_observed_vs_imputed.png
+#           Output/chart_5_price_by_size_system.png
+# Depends:  00_config.R → 01_ingest.R → 02_diagnosis.R → 03_clean.R → 04_impute.R
+#           Objects required: raw_file, df_clean, df_imputed, impute_log
+# =============================================================================
+
+if (!exists("df_imputed")) source("04_impute.r")
+
+suppressPackageStartupMessages({
+        library(ggplot2)
+        library(data.table)
+        library(stringr)
+})
+
+dir.create(OUTPUT_DIR, showWarnings = FALSE)
+
+message("[charts] Starting 04.1_charts.r ...")
+
+# =============================================================================
+# THEME — consistent across all charts
+# =============================================================================
+
+theme_shein <- theme_minimal(base_size = 11, base_family = "sans") +
+        theme(
+                plot.title       = element_text(face = "bold", size = 13,
+                                                colour = "#1a1a2e", margin = margin(b = 6)),
+                plot.subtitle    = element_text(size = 9.5, colour = "#555555",
+                                                margin = margin(b = 12)),
+                plot.caption     = element_text(size = 7.5, colour = "#999999",
+                                                hjust = 0, margin = margin(t = 10)),
+                axis.title       = element_text(size = 9.5, colour = "#333333"),
+                axis.text        = element_text(size = 8.5, colour = "#444444"),
+                panel.grid.major = element_line(colour = "#e8e8e8", linewidth = 0.3),
+                panel.grid.minor = element_blank(),
+                plot.background  = element_rect(fill = "#fafafa", colour = NA),
+                panel.background = element_rect(fill = "#fafafa", colour = NA),
+                legend.position  = "bottom",
+                legend.title     = element_text(size = 9, face = "bold"),
+                legend.text      = element_text(size = 8.5),
+                plot.margin      = margin(15, 15, 10, 15)
+        )
+
+# Palette
+pal <- c(
+        before  = "#e07a5f",   # terracotta
+        after   = "#3d405b",   # charcoal blue
+        accent  = "#81b29a",   # sage green
+        light   = "#f2cc8f",   # warm sand
+        imputed = "#e07a5f",   # terracotta (reuse for imputed)
+        observed = "#3d405b"   # charcoal blue (reuse for observed)
+)
+
+CHART_W <- 7
+CHART_H <- 4.5
+CHART_DPI <- 300
+
+# =============================================================================
+# CHART 1 — Missingness overview: % missing by variable, before & after
+# =============================================================================
+
+message("[charts] 1 — Missingness overview ...")
+
+# ── "Before" = raw_file (pre-cleaning) ──────────────────────────────────────
+
+raw_dt <- as.data.table(raw_file)
+
+# Compute % missing for the raw columns that map to cleaned columns
+raw_miss <- data.table(
+        variable = names(raw_dt),
+        missing_pct = sapply(raw_dt, function(x) {
+                round(sum(is.na(x) | as.character(x) == "") / length(x) * 100, 1)
+        }),
+        stage = "Before cleaning"
+)
+
+# ── "After" = df_imputed (post-cleaning + imputation) ───────────────────────
+
+imp_dt <- as.data.table(df_imputed)
+
+after_miss <- data.table(
+        variable = names(imp_dt),
+        missing_pct = sapply(imp_dt, function(x) {
+                round(sum(is.na(x) | as.character(x) == "") / length(x) * 100, 1)
+        }),
+        stage = "After cleaning"
+)
+
+# ── Align to a common set of conceptual variables ───────────────────────────
+# Map raw column names → cleaned equivalents for side-by-side comparison
+
+raw_miss[variable == "sku",         variable := "sku"]
+raw_miss[variable == "url",         variable := "url"]
+raw_miss[variable == "name",        variable := "name"]
+raw_miss[variable == "price",       variable := "price"]
+raw_miss[variable == "brand",       variable := "brand"]
+raw_miss[variable == "description", variable := "color (from description)"]
+raw_miss[variable == "size",        variable := "size_system (from size)"]
+raw_miss[variable == "images",      variable := "images"]
+
+after_miss[variable == "color",       variable := "color (from description)"]
+after_miss[variable == "size_system", variable := "size_system (from size)"]
+
+# Keep only the variables that appear in both stages (or are meaningful)
+keep_vars <- c("sku", "url", "name", "price", "brand",
+               "color (from description)", "size_system (from size)", "images")
+
+raw_keep   <- raw_miss[variable %in% keep_vars]
+after_keep <- after_miss[variable %in% keep_vars]
+
+miss_combined <- rbind(raw_keep, after_keep)
+miss_combined[, stage := factor(stage, levels = c("Before cleaning", "After cleaning"))]
+
+# Order variables by "before" missingness (descending)
+var_order <- raw_keep[order(-missing_pct), variable]
+miss_combined[, variable := factor(variable, levels = rev(var_order))]
+
+p1 <- ggplot(miss_combined, aes(x = variable, y = missing_pct, fill = stage)) +
+        geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+        coord_flip() +
+        scale_fill_manual(values = c("Before cleaning" = pal[["before"]],
+                                     "After cleaning"  = pal[["after"]]),
+                          name = "") +
+        scale_y_continuous(labels = function(x) paste0(x, "%"),
+                           expand = expansion(mult = c(0, 0.08))) +
+        labs(
+                title    = "Missingness by Variable — Before vs. After Cleaning",
+                subtitle = "Percentage of rows with missing or empty values per field",
+                x = NULL,
+                y = "% Missing",
+                caption  = "Source: shein_sample_data | Pipeline stage: 04.1_charts.r"
+        ) +
+        theme_shein +
+        theme(legend.position = c(0.8, 0.2))
+
+ggsave(file.path(OUTPUT_DIR, "chart_1_missingness.png"),
+       p1, width = CHART_W, height = CHART_H, dpi = CHART_DPI)
+
+
+# =============================================================================
+# CHART 2 — Price distribution (numeric variable 1)
+# =============================================================================
+
+message("[charts] 2 — Price distribution ...")
+
+prices <- imp_dt[!is.na(price) & price > 0]
+
+p2 <- ggplot(prices, aes(x = price)) +
+        geom_histogram(binwidth = 1, fill = pal[["after"]], colour = "white",
+                       linewidth = 0.3, alpha = 0.9) +
+        geom_vline(aes(xintercept = median(price)),
+                   colour = pal[["before"]], linetype = "dashed", linewidth = 0.7) +
+        annotate("text",
+                 x = median(prices$price) + 0.3,
+                 y = Inf, vjust = 1.8, hjust = 0,
+                 label = paste0("Median = $", round(median(prices$price), 2)),
+                 size = 3.2, colour = pal[["before"]], fontface = "bold") +
+        scale_x_continuous(labels = scales::dollar_format(),
+                           expand = expansion(mult = c(0.02, 0.05))) +
+        scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+        labs(
+                title    = "Distribution of Product Prices",
+                subtitle = "Post-cleaning histogram with median reference line",
+                x = "Price (USD)",
+                y = "Number of Products",
+                caption  = "Source: shein_imputed | Pipeline stage: 04.1_charts.r"
+        ) +
+        theme_shein
+
+ggsave(file.path(OUTPUT_DIR, "chart_2_price_distribution.png"),
+       p2, width = CHART_W, height = CHART_H, dpi = CHART_DPI)
+
+
+# =============================================================================
+# CHART 3 — Size count distribution (numeric variable 2)
+# =============================================================================
+
+message("[charts] 3 — Size count distribution ...")
+
+size_counts <- imp_dt[!is.na(size_count)]
+
+p3 <- ggplot(size_counts, aes(x = factor(size_count))) +
+        geom_bar(fill = pal[["accent"]], colour = "white", linewidth = 0.3,
+                 alpha = 0.9) +
+        geom_text(stat = "count", aes(label = after_stat(count)),
+                  vjust = -0.4, size = 3, colour = "#333333") +
+        scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+        labs(
+                title    = "Distribution of Size Option Counts per Product",
+                subtitle = "Number of size variants offered (e.g. XS, S, M, L = 4)",
+                x = "Number of Size Options",
+                y = "Number of Products",
+                caption  = "Source: shein_imputed | Pipeline stage: 04.1_charts.r"
+        ) +
+        theme_shein
+
+ggsave(file.path(OUTPUT_DIR, "chart_3_size_count_distribution.png"),
+       p3, width = CHART_W, height = CHART_H, dpi = CHART_DPI)
+
+
+# =============================================================================
+# CHART 4 — Observed vs. imputed prices
+# =============================================================================
+
+message("[charts] 4 — Observed vs. imputed comparison ...")
+
+if ("price_flag" %in% names(imp_dt)) {
+        
+        # Create a comparison dataset
+        obs_imp <- imp_dt[price_flag %in% c("ok", "imputed") & !is.na(price)]
+        obs_imp[, status := fifelse(price_flag == "imputed", "Imputed", "Observed")]
+        obs_imp[, status := factor(status, levels = c("Observed", "Imputed"))]
+        
+        # Strip chart (jittered dots) + boxplot overlay
+        p4 <- ggplot(obs_imp, aes(x = status, y = price, fill = status)) +
+                geom_boxplot(width = 0.4, alpha = 0.25, outlier.shape = NA,
+                             colour = "#555555", linewidth = 0.4) +
+                geom_jitter(aes(colour = status), width = 0.12, size = 2.5,
+                            alpha = 0.7, shape = 16) +
+                scale_fill_manual(values = c("Observed" = pal[["observed"]],
+                                             "Imputed"  = pal[["imputed"]])) +
+                scale_colour_manual(values = c("Observed" = pal[["observed"]],
+                                               "Imputed"  = pal[["imputed"]])) +
+                scale_y_continuous(labels = scales::dollar_format()) +
+                labs(
+                        title    = "Observed vs. Imputed Prices",
+                        subtitle = "Imputed values use grouped median (one_size group)",
+                        x = NULL,
+                        y = "Price (USD)",
+                        caption  = "Source: shein_imputed | Pipeline stage: 04.1_charts.r"
+                ) +
+                theme_shein +
+                theme(legend.position = "none")
+        
+} else {
+        # Fallback: empty chart with note
+        p4 <- ggplot() +
+                annotate("text", x = 0.5, y = 0.5,
+                         label = "price_flag column not found — cannot compare",
+                         size = 4, colour = "#999999") +
+                theme_void()
+}
+
+ggsave(file.path(OUTPUT_DIR, "chart_4_observed_vs_imputed.png"),
+       p4, width = CHART_W, height = CHART_H, dpi = CHART_DPI)
+
+
+# =============================================================================
+# CHART 5 — Price by size system (substantive insight)
+# =============================================================================
+
+message("[charts] 5 — Price by size system ...")
+
+by_system <- imp_dt[!is.na(price) & !is.na(size_system)]
+
+# Reorder size_system by median price for readability
+sys_order <- by_system[, .(med = median(price)), by = size_system][order(med), size_system]
+by_system[, size_system := factor(size_system, levels = sys_order)]
+
+p5 <- ggplot(by_system, aes(x = size_system, y = price, fill = size_system)) +
+        geom_boxplot(alpha = 0.5, outlier.shape = 21, outlier.size = 1.5,
+                     outlier.fill = pal[["before"]], colour = "#555555",
+                     linewidth = 0.4) +
+        geom_jitter(width = 0.15, size = 2, alpha = 0.5,
+                    colour = pal[["after"]], shape = 16) +
+        coord_flip() +
+        scale_y_continuous(labels = scales::dollar_format()) +
+        scale_fill_manual(values = rep(pal[["light"]], length(sys_order))) +
+        labs(
+                title    = "Price Distribution by Size System",
+                subtitle = "Different product categories occupy distinct price bands",
+                x = NULL,
+                y = "Price (USD)",
+                caption  = "Source: shein_imputed | Pipeline stage: 04.1_charts.r"
+        ) +
+        theme_shein +
+        theme(legend.position = "none")
+
+ggsave(file.path(OUTPUT_DIR, "chart_5_price_by_size_system.png"),
+       p5, width = CHART_W, height = CHART_H, dpi = CHART_DPI)
+
+# =============================================================================
+# CHART 6 — Top 10 most expensive brands by median price
+# =============================================================================
+
+message("[charts] 6 — Top 10 most expensive brands ...")
+
+brand_dt <- imp_dt[!is.na(price) & price > 0 & !is.na(brand) & brand != ""]
+
+# Compute median price and count per brand
+brand_summary <- brand_dt[, .(
+        median_price = median(price),
+        n = .N
+), by = brand]
+
+# Keep only the top 10 by median price
+brand_summary <- brand_summary[order(-median_price)][1:min(10, .N)]
+
+# Factor for plot ordering (least → most expensive, bottom → top on coord_flip)
+brand_summary[, brand := factor(brand, levels = brand_summary[order(median_price), brand])]
+
+# Filter individual prices to only the top-10 brands for the dot overlay
+brand_dt_top <- brand_dt[brand %in% levels(brand_summary$brand)]
+brand_dt_top[, brand := factor(brand, levels = levels(brand_summary$brand))]
+
+p6 <- ggplot() +
+        # Bar for median price
+        geom_col(data = brand_summary,
+                 aes(x = brand, y = median_price),
+                 fill = pal[["after"]], alpha = 0.85, width = 0.5) +
+        # Individual price dots
+        geom_jitter(data = brand_dt_top,
+                    aes(x = brand, y = price),
+                    colour = pal[["before"]], size = 2.5, alpha = 0.7,
+                    width = 0.12, shape = 16) +
+        # Annotation: median + count
+        geom_text(data = brand_summary,
+                  aes(x = brand, y = median_price,
+                      label = sprintf("$%.2f  (n=%d)", median_price, n)),
+                  hjust = -0.12, size = 3, colour = "#333333", fontface = "bold") +
+        coord_flip() +
+        scale_y_continuous(labels = scales::dollar_format(),
+                           expand = expansion(mult = c(0, 0.25))) +
+        labs(
+                title    = "Top 10 Most Expensive Brands by Median Price",
+                subtitle = "Bars = median price \u00b7 Dots = individual product prices \u00b7 n = product count",
+                x = NULL,
+                y = "Price (USD)",
+                caption  = "Source: shein_imputed | Pipeline stage: 04.1_charts.r"
+        ) +
+        theme_shein
+
+ggsave(file.path(OUTPUT_DIR, "chart_6_brand_price_ranking.png"),
+       p6, width = CHART_W, height = CHART_H, dpi = CHART_DPI)
+
+
+# =============================================================================
+# SUMMARY
+# =============================================================================
+cat("\n=== [05_charts] Charts saved ===\n")
+chart_files <- list.files(OUTPUT_DIR, pattern = "^chart_.*\\.png$", full.names = TRUE)
+for (f in chart_files) cat("  ", f, "\n")
+cat("\n")
+
+message("[charts] 04.1_charts.r complete.")
 
