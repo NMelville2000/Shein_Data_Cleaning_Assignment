@@ -1,5 +1,5 @@
 # =============================================================================
-# 05_data_dictionary.R
+# data_dictionary.r
 # Project:  Shein Data Quality Pipeline
 # Purpose:  Build a one-row-per-variable data dictionary from the pipeline
 #           objects (raw_file, df_clean, df_imputed).
@@ -20,7 +20,7 @@ suppressPackageStartupMessages({
 
 dir.create(OUTPUT_DIR, showWarnings = FALSE)
 
-message("[dict] Starting 05_data_dictionary.r ...")
+message("[dict] Starting data_dictionary.r ...")
 
 # =============================================================================
 # SECTION A — Helper: compute % missing (NA or "")
@@ -305,4 +305,5 @@ freezePane(wb, sheet_name, firstRow = TRUE)
 saveWorkbook(wb, DIAGNOSTICS_FILE, overwrite = TRUE)
 
 message("[dict] Sheet '", sheet_name, "' added → ", DIAGNOSTICS_FILE)
-message("[dict] 05_data_dictionary.r complete.")
+message("[dict] data_dictionary.r complete.")
+
