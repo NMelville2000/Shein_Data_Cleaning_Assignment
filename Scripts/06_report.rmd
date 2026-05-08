@@ -1,0 +1,404 @@
+---
+title: "SHEIN Data Cleaning Assignment — Automated Report"
+author: "Nicky Melville"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  word_document:
+    reference_docx: null
+    toc: true
+    toc_depth: 2
+    fig_width: 7
+    fig_height: 4.5
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+        echo    = FALSE,
+        warning = FALSE,
+        message = FALSE,
+        fig.dpi = 300
+)
+
+# ── Load pipeline objects ────────────────────────────────────────────────────
+# These must already exist in the environment before knitting.
+# 06_report.r sources the upstream scripts and then calls rmarkdown::render().
+
+library(data.table)
+library(ggplot2)
+library(knitr)
+library(scales)
+library(stringr)
+library(stringi)
+
+# Convenience references
+raw_dt  <- as.data.table(raw_file)
+imp_dt  <- as.data.table(df_imputed)
+cln_dt  <- as.data.table(df_clean)
+
+# Helper: % missing
+pct_miss <- function(x) round(sum(is.na(x) | as.character(x) == "") / length(x) * 100, 1)
+
+# ── Consistent chart theme ──────────────────────────────────────────────────
+theme_shein <- theme_minimal(base_size = 11) +
+        theme(
+                plot.title       = element_text(face = "bold", size = 13, colour = "#1a1a2e"),
+                plot.subtitle    = element_text(size = 9.5, colour = "#555555"),
+                plot.caption     = element_text(size = 7.5, colour = "#999999", hjust = 0),
+                panel.grid.minor = element_blank(),
+                plot.background  = element_rect(fill = "#fafafa", colour = NA),
+                panel.background = element_rect(fill = "#fafafa", colour = NA)
+        )
+
+pal <- c(before = "#e07a5f", after = "#3d405b", accent = "#81b29a", light = "#f2cc8f")
+```
+
+# 1. Dataset Overview
+
+This report documents the data quality pipeline applied to the SHEIN product dataset. All figures and summary statistics are generated programmatically from the cleaned dataset — no values have been manually entered.
+
+```{r overview-table}
+overview_df <- data.frame(
+        Item = c(
+                "Source",
+                "Raw file",
+                "Rows (raw)",
+                "Columns (raw)",
+                "Rows (after deduplication)",
+                "Columns (after cleaning)",
+                "Columns (after imputation)",
+                "Date of download"
+        ),
+        Value = c(
+                "SHEIN US product scrape (shein_sample.csv / shein_sample_all_rows.xlsx)",
+                RAW_FILE_PATH,
+                formatC(nrow(raw_dt), big.mark = ","),
+                ncol(raw_dt),
+                formatC(nrow(imp_dt), big.mark = ","),
+                ncol(cln_dt),
+                ncol(imp_dt),
+                "Not recorded in dataset — no scraped_at timestamp detected"
+        ),
+        stringsAsFactors = FALSE
+)
+
+kable(overview_df, col.names = c("Item", "Value"), caption = "Dataset overview")
+```
+
+The raw dataset contains `r ncol(raw_dt)` columns: `r paste(names(raw_dt), collapse = ", ")`.
+
+After cleaning and imputation, the final dataset contains `r ncol(imp_dt)` columns: `r paste(names(imp_dt), collapse = ", ")`.
+
+# 2. Data Quality Diagnostics Before Cleaning
+
+The exploratory diagnostics (produced by `02_diagnosis.R`) identified the following issues in the raw data prior to any cleaning.
+
+## 2.1 Missingness
+
+```{r raw-missingness-table}
+raw_miss <- data.frame(
+        Variable    = names(raw_dt),
+        Missing_N   = sapply(raw_dt, function(x) sum(is.na(x) | as.character(x) == "")),
+        Missing_Pct = sapply(raw_dt, function(x) pct_miss(x)),
+        stringsAsFactors = FALSE
+)
+raw_miss <- raw_miss[order(-raw_miss$Missing_Pct), ]
+
+kable(raw_miss, row.names = FALSE,
+      col.names = c("Variable", "Missing (n)", "Missing (%)"),
+      caption = "Missingness in raw data (before cleaning)")
+```
+
+## 2.2 Duplicates
+
+```{r duplicates}
+n_dup_raw <- sum(duplicated(raw_dt))
+```
+
+The raw dataset contained **`r formatC(n_dup_raw, big.mark = ",")`** exact duplicate rows. These were removed during SKU deduplication in `03_clean.R`.
+
+## 2.3 Other Issues Identified
+
+The following data quality issues were documented during the diagnostic phase:
+
+- **Price**: Stored as a character string with a leading "$" symbol. Required stripping and numeric coercion.
+- **Brand**: Contained mojibake (corrupted encoding) with category breadcrumbs appended after a garbled character (e.g. `QingSang?Accessories Apparel Accessories`). Required transliteration and regex extraction.
+- **Description**: A serialised Python-style key-value string (e.g. `[{'Color': 'Black'}, {'Material': 'Woven Fabric'}]`). Not directly usable; required parsing to extract individual attributes.
+- **Size**: A multi-value string encoding several different size systems (standard letter, US numeric, shoe international, bedding dimensions, etc.) in a single column. Required classification and splitting.
+- **Images**: Contains raw Python-style list syntax with single-quoted URLs. Cleaning deferred to a later pipeline stage.
+
+# 3. Cleaning Decisions
+
+Each cleaning operation is documented below with the rationale for the approach taken.
+
+## 3.1 SKU — Prefix Stripping and Deduplication
+
+**Issue:** Raw SKU values contain a `"SKU: "` prefix. Multiple rows may exist per product due to repeated scraping sessions.
+
+**Action:** Stripped the prefix with `str_remove(sku, "^SKU:\\s*")`, then deduplicated rows using `unique(dt, by = "sku")`.
+
+**Rationale:** The SKU is the natural primary key. The prefix is a display artefact and adds no information. Deduplication ensures one row per product.
+
+```{r sku-dedup}
+n_raw <- nrow(raw_dt)
+n_clean <- nrow(cln_dt)
+```
+
+**Result:** `r formatC(n_raw, big.mark = ",")` raw rows → `r formatC(n_clean, big.mark = ",")` unique products (`r formatC(n_raw - n_clean, big.mark = ",")` duplicates removed).
+
+## 3.2 Price — Numeric Coercion and Flagging
+
+**Issue:** Price stored as character with leading `"$"` (e.g. `"$7.25"`).
+
+**Action:** Stripped non-numeric characters and coerced to `numeric`. Created a `price_flag` column with values: `ok`, `missing`, `invalid` (≤ 0), `outlier_high` (> $10,000).
+
+**Rationale:** Price must be numeric for any downstream analysis. The flag preserves provenance — analysts can filter on `price_flag` to include or exclude problematic rows.
+
+```{r price-flag-table}
+if ("price_flag" %in% names(cln_dt)) {
+        pf <- as.data.frame(cln_dt[, .N, by = price_flag][order(-N)])
+        kable(pf, col.names = c("Price Flag", "Count"),
+              caption = "Price flag distribution (after cleaning, before imputation)")
+}
+```
+
+## 3.3 Brand — Mojibake Repair
+
+**Issue:** Brand field contains encoding corruption followed by a category breadcrumb (e.g. `QingSang?Accessories Apparel Accessories`). Many products have no brand at all.
+
+**Action:** Applied `stri_trans_general(brand, "latin-ascii")` to transliterate encoding, then extracted the brand name before the first corrupted character with `str_extract(brand, "^[^?]+")`. Empty or unrecoverable values set to `NA`.
+
+**Rationale:** The breadcrumb is scraper noise, not part of the brand name. Setting empty values to `NA` (rather than a placeholder) preserves honest missingness for downstream analysis.
+
+## 3.4 Color — Extraction from Description
+
+**Issue:** Colour is embedded inside a serialised key-value string in the `description` column, not available as a standalone field.
+
+**Action:** Extracted the `Color` value using `str_extract(description, "(?<='Color':\\s')[^']+")`. Dropped the `description` column entirely.
+
+**Rationale:** Only the `Color` attribute had sufficient coverage to justify extraction as a standalone variable for imputation. Other attributes (Material, Style, Pattern Type, etc.) were below threshold. Dropping `description` reduces the dataset to analytically useful columns.
+
+## 3.5 Size — System Classification and Column Splitting
+
+**Issue:** The `size` column encodes multiple incompatible sizing systems in a single comma-separated string (e.g. `XS(2),S(4),M(6),L(8/10)` for clothing vs. `135*200,160*220` for bedding vs. `CN35(US5.5),CN36(US6)` for shoes).
+
+**Action:** Classified each row's size system using a priority-ordered `fcase()` chain with 15 categories. Split the original column into five derived columns: `size_system`, `size_labels`, `size_us`, `dimensions_raw`, `size_count`.
+
+**Rationale:** A single column cannot represent fundamentally different measurement systems. The classification allows downstream grouping (e.g. for price imputation by product type). All size columns are present in every row, with `NA` for non-applicable systems, to preserve the single-file structure needed for imputation workflows.
+
+```{r size-system-table}
+if ("size_system" %in% names(imp_dt)) {
+        ss <- as.data.frame(imp_dt[, .N, by = size_system][order(-N)])
+        kable(ss, col.names = c("Size System", "Count"),
+              caption = "Size system distribution in final dataset")
+}
+```
+
+## 3.6 Drop Log
+
+All column drops and replacements are recorded in the pipeline's `clean_drop_log`.
+
+```{r drop-log}
+if (exists("clean_drop_log") && nrow(clean_drop_log) > 0) {
+        kable(clean_drop_log, caption = "Column drop/replace log from 03_clean.R")
+}
+```
+
+# 4. Imputation Applied
+
+## 4.1 Price — Grouped Median Imputation
+
+**Variable:** `price`
+
+**Method:** Median imputation, grouped by `size_system`.
+
+**Justification:** Retail product prices are right-skewed — the mean is pulled upward by expensive items, making median a more robust central estimate. Grouping by `size_system` ensures that products in different price bands (e.g. one-size accessories vs. multi-size clothing) receive group-appropriate fill values rather than a single global value.
+
+All missing prices were concentrated in the `one_size` group. These were filled with the `one_size` group median. Imputed rows are flagged with `price_flag = "imputed"`.
+
+**Alternatives considered and rejected:**
+
+- **Mean imputation** — inappropriate given right-skewed price distribution; would systematically overestimate.
+- **Mode imputation** — designed for categorical variables, not continuous prices.
+- **Hot-deck imputation** — adds stochastic variation that is harder to reproduce and justify.
+- **Constant/flag imputation** — filling with 0 or "Unknown" would distort numeric analysis.
+- **Leave missing** — rejected because price is a core analytic variable; NAs would propagate through every price-dependent calculation.
+
+## 4.2 Variables Left as Missing
+
+The following variables were **not imputed**, with justification:
+
+- **brand** — High-cardinality categorical variable with a dominant missing class. Most SHEIN products are unbranded; missingness is informative, not random. Mode imputation would create false brand associations.
+- **color** — Structurally absent where the raw `description` field lacked a Color key. Imputation would require predicting colour from product names or images, which is beyond the scope of tabular imputation.
+- **size_labels, size_us, dimensions_raw** — These are structural NAs by design. The column is not applicable to certain product types (e.g. `dimensions_raw` is only for bedding). These are not missing data; they are intentional nulls.
+- **size_system** — Products classified as `"unknown"` could not be matched by any regex pattern. Imputing a system would propagate a guess into every derived size column, compounding the error.
+
+```{r impute-log}
+if (exists("impute_log") && nrow(impute_log) > 0) {
+        kable(impute_log, caption = "Imputation log from 04_impute.R")
+}
+```
+
+## 4.3 Observed vs. Imputed Comparison
+
+```{r chart-observed-vs-imputed, fig.cap="Comparison of observed and imputed price values"}
+if ("price_flag" %in% names(imp_dt)) {
+        obs_imp <- imp_dt[price_flag %in% c("ok", "imputed") & !is.na(price)]
+        obs_imp[, status := fifelse(price_flag == "imputed", "Imputed", "Observed")]
+        obs_imp[, status := factor(status, levels = c("Observed", "Imputed"))]
+
+        ggplot(obs_imp, aes(x = status, y = price, fill = status)) +
+                geom_boxplot(width = 0.4, alpha = 0.25, outlier.shape = NA,
+                             colour = "#555555", linewidth = 0.4) +
+                geom_jitter(aes(colour = status), width = 0.12, size = 2.5,
+                            alpha = 0.7, shape = 16) +
+                scale_fill_manual(values = c("Observed" = pal[["after"]],
+                                             "Imputed"  = pal[["before"]])) +
+                scale_colour_manual(values = c("Observed" = pal[["after"]],
+                                               "Imputed"  = pal[["before"]])) +
+                scale_y_continuous(labels = dollar_format()) +
+                labs(title = "Observed vs. Imputed Prices",
+                     subtitle = "Imputed values use grouped median (one_size group)",
+                     x = NULL, y = "Price (USD)") +
+                theme_shein + theme(legend.position = "none")
+}
+```
+
+# 5. Post-Cleaning Summary
+
+## 5.1 Final Dataset Dimensions
+
+```{r final-dims}
+dims_df <- data.frame(
+        Metric = c("Rows", "Columns"),
+        Value  = c(formatC(nrow(imp_dt), big.mark = ","), ncol(imp_dt)),
+        stringsAsFactors = FALSE
+)
+kable(dims_df, col.names = c("Metric", "Value"),
+      caption = "Final dataset dimensions (after cleaning and imputation)")
+```
+
+## 5.2 Summary Statistics for Numeric Variables
+
+```{r summary-stats}
+num_cols <- names(imp_dt)[sapply(imp_dt, is.numeric)]
+
+if (length(num_cols) > 0) {
+        stats_list <- lapply(num_cols, function(col) {
+                x <- imp_dt[[col]][!is.na(imp_dt[[col]])]
+                data.frame(
+                        Variable = col,
+                        N        = length(x),
+                        Min      = round(min(x), 2),
+                        Q1       = round(quantile(x, 0.25), 2),
+                        Median   = round(median(x), 2),
+                        Mean     = round(mean(x), 2),
+                        Q3       = round(quantile(x, 0.75), 2),
+                        Max      = round(max(x), 2),
+                        SD       = round(sd(x), 2),
+                        stringsAsFactors = FALSE
+                )
+        })
+        stats_df <- do.call(rbind, stats_list)
+        kable(stats_df, row.names = FALSE,
+              caption = "Summary statistics for numeric variables")
+}
+```
+
+## 5.3 Final Missingness
+
+```{r final-missingness-table}
+final_miss <- data.frame(
+        Variable    = names(imp_dt),
+        Missing_N   = sapply(imp_dt, function(x) sum(is.na(x) | as.character(x) == "")),
+        Missing_Pct = sapply(imp_dt, function(x) pct_miss(x)),
+        stringsAsFactors = FALSE
+)
+final_miss <- final_miss[order(-final_miss$Missing_Pct), ]
+
+kable(final_miss, row.names = FALSE,
+      col.names = c("Variable", "Missing (n)", "Missing (%)"),
+      caption = "Missingness in final dataset (after cleaning and imputation)")
+```
+
+## 5.4 Missingness Before vs. After
+
+```{r chart-missingness, fig.cap="Missingness comparison before and after cleaning"}
+# Build before/after comparison on aligned variable names
+raw_map <- c(sku = "sku", url = "url", name = "name", price = "price",
+             brand = "brand", color = "description", size_system = "size",
+             images = "images")
+
+before_df <- data.frame(
+        variable = names(raw_map),
+        missing_pct = sapply(raw_map, function(rc) pct_miss(raw_dt[[rc]])),
+        stage = "Before cleaning",
+        stringsAsFactors = FALSE
+)
+
+after_df <- data.frame(
+        variable = names(raw_map),
+        missing_pct = sapply(names(raw_map), function(fc) {
+                if (fc %in% names(imp_dt)) pct_miss(imp_dt[[fc]]) else NA_real_
+        }),
+        stage = "After cleaning",
+        stringsAsFactors = FALSE
+)
+
+miss_comb <- rbind(before_df, after_df)
+miss_comb$stage <- factor(miss_comb$stage, levels = c("Before cleaning", "After cleaning"))
+var_order <- before_df$variable[order(before_df$missing_pct)]
+miss_comb$variable <- factor(miss_comb$variable, levels = var_order)
+
+ggplot(miss_comb, aes(x = variable, y = missing_pct, fill = stage)) +
+        geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+        coord_flip() +
+        scale_fill_manual(values = c("Before cleaning" = pal[["before"]],
+                                     "After cleaning"  = pal[["after"]]), name = "") +
+        scale_y_continuous(labels = function(x) paste0(x, "%")) +
+        labs(title = "Missingness by Variable — Before vs. After",
+             x = NULL, y = "% Missing") +
+        theme_shein + theme(legend.position = c(0.8, 0.2))
+```
+
+## 5.5 Price Distribution
+
+```{r chart-price, fig.cap="Post-cleaning price distribution"}
+prices <- imp_dt[!is.na(price) & price > 0]
+
+ggplot(prices, aes(x = price)) +
+        geom_histogram(binwidth = 1, fill = pal[["after"]], colour = "white",
+                       linewidth = 0.3, alpha = 0.9) +
+        geom_vline(aes(xintercept = median(price)),
+                   colour = pal[["before"]], linetype = "dashed", linewidth = 0.7) +
+        annotate("text", x = median(prices$price) + 0.3, y = Inf, vjust = 1.8, hjust = 0,
+                 label = paste0("Median = $", round(median(prices$price), 2)),
+                 size = 3.2, colour = pal[["before"]], fontface = "bold") +
+        scale_x_continuous(labels = dollar_format()) +
+        labs(title = "Distribution of Product Prices",
+             subtitle = "Post-cleaning histogram with median reference line",
+             x = "Price (USD)", y = "Number of Products") +
+        theme_shein
+```
+
+# 6. Limitations and Known Risks
+
+1. **No scrape timestamp.** The diagnostics did not detect a `scraped_at` column. Without it, the pipeline cannot verify data freshness or identify stale records from older scraping sessions.
+
+2. **Brand missingness is high.** Approximately `r pct_miss(imp_dt$brand)`% of products have no brand after cleaning. This is a structural feature of the SHEIN platform (most items are unbranded), not a data collection failure, but it limits any brand-level analysis.
+
+3. **Image column uncleaned.** The `images` column was carried forward in raw form (Python-style list syntax). It has not been deduplicated, validated, or split into individual URL columns. Downstream image analysis will require an additional cleaning step.
+
+4. **Size system "unknown" cases.** Products classified as `size_system = "unknown"` could not be matched by any of the 14 regex patterns. These may represent edge-case formats not anticipated by the classification rules. The derived size columns (`size_labels`, `size_us`, `size_count`) are `NA` for these rows.
+
+5. **Price imputation is deterministic.** The grouped median approach produces a single fill value per size system group. This means all imputed rows within a group receive the same price, which artificially reduces variance in that group. For analyses sensitive to distributional shape (e.g. price dispersion studies), this is a known distortion.
+
+6. **Sample size sensitivity.** If the pipeline is run on a small sample (e.g. the 9-row `shein_sample_data.xlsx`), group medians may be based on very few observations, making the imputed values unstable. The pipeline is designed for the full dataset.
+
+7. **Single-imputation limitation.** Only one imputation pass is performed. Multiple imputation (e.g. via the `mice` package) would produce more statistically valid uncertainty estimates but was not required by the assignment scope.
+
+8. **Regex classification is heuristic.** The size system classification relies on pattern matching against known formats. New or unusual size formats introduced by SHEIN after the scrape date may be misclassified.
+
+---
+
+*Report generated automatically by the Shein Data Quality Pipeline (`06_report.rmd`). All figures and statistics are computed from pipeline objects — no values were manually entered.*
