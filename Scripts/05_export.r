@@ -265,3 +265,21 @@ cat("      No separate Python export is required.\n\n")
 
 message("[export] 05_export.r complete.")
 
+# 
+# 
+# library(data.table)
+# 
+# # If df_clean is already in your environment, use it directly:
+# dt <- as.data.table(df_clean)
+# 
+# # Or load from the exported file:
+# # dt <- fread("Output/shein_cleaned.csv")
+# 
+# # One example row per size_system, showing the cleaned output columns
+# example_table <- dt[,
+#                     .SD[1],
+#                     by = size_system,
+#                     .SDcols = c("size_labels", "size_us", "dimensions_raw", "size_count")
+# ][order(-size_count, na.last = TRUE)]
+# 
+# print(example_table, nrows = 20)
