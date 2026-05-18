@@ -2,156 +2,122 @@
 
 ## Project overview
 
-This repository contains an R based data quality workflow for the Shein assignment. The pipeline is set up to read the raw SHEIN CSV file, validate the structure of the imported data, generate an exploratory diagnostics workbook that documents issues found in scope, and produce a structurally cleaned output ready for downstream missing value imputation. The current workflow is built around four core scripts: `00_config.R`, `01_ingest.R`, `02_diagnosis.R`, and `03_clean.R`. These scripts define the project paths and constants, ingest the raw CSV with `fread()`, create a multi sheet Excel diagnostics workbook in the `Output` folder, and apply systematic structural cleaning to produce a single analysis ready file.
+This repository contains an R based data quality workflow for the Shein assignment. The pipeline reads the raw SHEIN CSV file, validates the structure of the imported data, generates an exploratory diagnostics workbook, and produces a structurally cleaned output file ready for downstream missing value imputation. The workflow is consolidated into a single master script `pipeline.r` which runs three logical stages sequentially: configuration and ingestion (`00_config` and `01_ingest`), exploratory diagnostics (`02_diagnosis`), and structural cleaning (`03_clean`).
 
 ## Project objective
 
 The purpose of this project is to build a clear, reproducible data quality pipeline that can:
 
-- read the raw dataset safely
-- validate that the input file exists and loads correctly
+- read the raw dataset safely and validate the input file
 - identify missingness, duplicates, parsing issues, range problems, text issues, URL issues, and extracted description attributes
-- apply systematic structural cleaning decisions with explicit rationale for each
-- produce a single cleaned file preserving all size system columns so that imputation algorithms can group and operate on the full dataset without requiring a reshape step
-- save the diagnostics into a workbook that can support the written report and cleaning decisions
+- save the diagnostics into a workbook that supports the written report and cleaning decisions
+- clean and restructure the raw data into a single wide output file suitable for imputation workflows
 
 ## Current workflow
 
-The current pipeline is organised into four scripts.
+The pipeline is organised as a single file `pipeline.r` containing three logical stages that run top to bottom. Run the entire pipeline smoothly in `run_pipeline.r`. 
 
-### `00_config.R`
+### Stage 1 — Configuration and ingestion (`00_config` + `01_ingest`)
 
-This script stores the project paths, constants, and startup checks. It defines the raw file path as `Raw_data/shein_sample.csv`, the output directory as `Output`, the diagnostics workbook path as `Output/shein_exploratory_diagnostics.xlsx`, and the report file path as `Output/shein_data_quality_report.html`. It also defines runtime constants such as the Excel sample row limit, the IQR multiplier for outlier detection, the long text threshold, the set of messy missing values used in numeric parsing, and the accepted date parsing orders. It stops execution if the raw CSV is not found.
+This stage defines project paths and runtime constants, creates the output directory, validates that the raw CSV exists, loads all required libraries, and reads the raw CSV with `data.table::fread()`. The data is kept as a `data.table` throughout to avoid unnecessary type conversions. Runtime constants include the Excel sample row limit (capped at 1,000 for readable workbook sheets), the IQR multiplier for outlier detection, the long text threshold, the set of messy missing values used in numeric parsing, and the accepted date parsing orders.
 
-### `01_ingest.R`
+### Stage 2 — Exploratory diagnostics (`02_diagnosis`)
 
-This script loads the required libraries, reads the raw CSV with `data.table::fread()`, converts the result to a `data.frame`, validates that the data has rows and columns, and prints a quick structural review to the console. It is designed to expose `raw_file` for downstream scripts.
+This stage converts the raw data to a `data.frame` locally for dplyr based diagnostics work. It includes helper functions for Excel safe text cleaning, automatic column detection, and workbook writing. It builds summaries for overview metrics, detected columns, description key value extraction, variable types, missingness (computed once and reused across summaries), duplicate checks, image URL within-record duplication, numeric range checks, numeric parsing issues, price and discount checks, URL checks, datetime checks, text quality, level summaries, and flagged problem rows. The workbook writes twenty sheets to `Output/shein_exploratory_diagnostics.xlsx`.
 
-### `02_diagnosis.R`
+### Stage 3 — Structural cleaning (`03_clean`)
 
-This script creates the exploratory diagnostics workbook. It includes helper functions for Excel safe text cleaning, automatic column detection, and workbook writing. It builds summaries for overview metrics, detected columns, description key value extraction, variable types, missingness, duplicate checks, image URL duplication, numeric range checks, numeric parsing issues, price and discount checks, URL checks, datetime checks, text quality, level summaries, and flagged problem rows. The workbook currently writes twenty sheets to `Output/shein_exploratory_diagnostics.xlsx`.
+This stage operates on a `copy()` of the raw `data.table` and performs the following cleaning steps:
 
-### `03_clean.R`
+**Section A–B: Working copy and drop log.** Creates an independent copy of the data and initialises a drop log that records every column removed or replaced with the action taken and the reason.
 
-This script applies systematic structural cleaning to produce a single wide `data.frame` named `df_clean`, one row per product SKU, ready for missing value imputation. It depends on `raw_file` from `01_ingest.R` and the `detected` column map from `02_diagnosis.R`, sourcing them automatically if they are not already in the environment. It maintains a `clean_drop_log` recording every column removed or replaced with explicit rationale, which is printed to the console at the end of every run. The cleaned dataset is exported to `Output/shein_cleaned.csv`.
+**Section C: SKU.** Strips the `SKU:` prefix and deduplicates rows by SKU.
 
-The cleaning is organised into labelled sections A through J. Each section is described below.
+**Section D: Price.** Strips currency symbols, coerces to numeric, and adds a `price_flag` column (missing, invalid, outlier_high, or ok). Includes a guard against renaming the column to itself if the detected column is already named `price`.
 
-## Cleaning decisions in `03_clean.R`
+**Section E: Brand.** Fixes mojibake encoding using `stringi::stri_trans_general()`, extracts the brand name before corrupted characters, and sets empty or unrecoverable brands to `NA`.
 
-Each section below corresponds directly to a labelled section of the script. Rationale is stated explicitly because every structural decision affects imputation grouping downstream.
+**Section F: Color.** Extracts the Color value from the serialised description field using `str_match()` with a capturing group that handles zero or more spaces after the colon. Drops the description column entirely; only Color is retained for imputation use. All other description attributes (Material, Style, etc.) are dropped below coverage threshold.
 
-### Section A — Working copy
+**Section G: Size.** This is the most complex cleaning step and handles multiple size systems in a single column. The process follows five sub-steps:
 
-`raw_file` is converted to a `data.table` immediately using `as.data.table()` and `setDT()`. This ensures all subsequent `:=` assignment operations use `data.table` reference semantics without triggering shallow copy warnings.
+1. *Spacing normalisation* — collapses internal spaces and normalises parenthesis and comma spacing so that variants like `XS (2),S (4)` and `XS(2),S(4)` are treated identically before any classification.
 
-### Section B — Drop log initialisation
+2. *Modifier flags* — extracts `has_petite`, `has_tall`, and `has_plus` as boolean flags before classification, so multi-fit strings that span petite plus standard or petite plus plus are correctly described.
 
-A `clean_drop_log` `data.frame` is initialised with three columns: `column`, `action`, and `reason`. A helper function `log_drop()` appends one row per cleaning action throughout the script. The log is printed at the end of every run and is available in the environment for inspection. This ensures that no column is silently removed and that every structural decision is documented for the report.
+3. *Revised classification* — applies a priority ordered `fcase()` that classifies each row into one of: `one_size`, `missing`, `dimensions`, `shoe_intl`, `shoe_us`, `bra`, `kids`, `jeans`, `volume_length`, `plus`, `us_clothing`, `eu_clothing`, `standard`, `us_letter`, or `unknown`. Key fixes from supervisor review include: anchoring `shoe_us` with `^US` to avoid matching waist sizes, splitting `shoe_intl` to handle CN and EUR separately so EUR alone does not match EU clothing sizes, moving `volume_length` above `us_letter` so strings like `1.5M` classify correctly, extending bra cup patterns to include DD and AA, and using word boundary matching for Tall.
 
-### Section C — SKU
+4. *Vectorised column extraction* — uses `data.table` subset-assign per system instead of row-by-row `mapply()`. Produces `size_labels`, `size_us`, `size_eu`, `dimensions_raw`, `waist`, `inseam` as applicable per system with `NA` for non-applicable systems.
 
-The raw SKU field contains a literal prefix of the form `SKU:` before the actual identifier. This is stripped with `str_remove()` and `str_trim()`. Deduplication is then applied by SKU using `data.table::unique(by = "sku")`, retaining the first occurrence of each product across scrape sessions. Row counts before and after deduplication are printed to the console.
+5. *Size count fix* — marks range-notation rows (containing a hyphen but not an asterisk) as `NA` for count rather than silently undercounting.
 
-### Section D — Price
+**Section H: Images.** Extracts and deduplicates URLs from the raw scraped image string, producing `images_clean` (pipe-separated deduplicated URLs) and `images_n` (count of unique images per product). Drops the raw `images` column.
 
-Raw price values are stored as character strings such as `$7.25`. The dollar sign and any other non-numeric characters are stripped with `str_replace_all()` and the result is coerced to numeric. A companion flag column `price_flag` is added with four levels:
+**Sections I–K: Assembly, summary, and export.** Assembles the final cleaned data frame with a defined column priority order, prints summary diagnostics to the console (column names, missing value counts, size system distribution, price flag distribution, and the drop log), and exports to `Output/shein_cleaned.csv` using `fwrite()`.
 
-- `missing` — price could not be parsed or is `NA`
-- `invalid` — price is zero or negative
-- `outlier_high` — price exceeds $10,000
-- `ok` — passes all checks
+## Final cleaned output columns
 
-The original price column is replaced in place and renamed to `price`. The intermediate `price_clean` column is removed. The flag column is retained in the final output because downstream imputation models may want to exclude or weight flagged rows differently.
+The cleaned output `shein_cleaned.csv` contains the following columns in priority order:
 
-### Section E — Brand
+- `sku` — deduplicated product identifier
+- `url` — product URL
+- `name` — product name
+- `price` — numeric price (currency symbol stripped)
+- `price_flag` — missing, invalid, outlier_high, or ok
+- `brand` — cleaned brand name (mojibake fixed, empty set to NA)
+- `color` — extracted from description field
+- `size_system` — classified size system (one_size, us_clothing, standard, shoe_intl, dimensions, etc.)
+- `size_count` — number of size options (NA for range notation and non-countable systems)
+- `size_labels` — letter or label component of sizes
+- `size_us` — US numeric size equivalents
+- `size_eu` — EU numeric size equivalents (shoe_intl and eu_clothing only)
+- `dimensions_raw` — raw dimension string (bedding products only)
+- `waist` — waist measurement (jeans only)
+- `inseam` — inseam measurement (jeans only)
+- `has_petite` — boolean modifier flag
+- `has_tall` — boolean modifier flag
+- `has_plus` — boolean modifier flag
+- `images_n` — count of unique image URLs per product
+- `images_clean` — deduplicated pipe-separated image URLs
 
-The raw brand field contains mojibake caused by a corrupted character embedded by the scraper between the actual brand name and a category breadcrumb. For example, a value such as `QingSang\x3fAccessories Apparel Accessories` contains only `QingSang` as the true brand. The script applies `stri_trans_general()` with the `latin-ascii` transform to normalise the encoding, then uses `str_extract()` to take only the portion of the string before the first corrupted or unknown character. Empty strings and unrecoverable values are set to `NA_character_`.
-
-### Section F — Color (extracted from description)
-
-The `description` column holds a serialised Python-style list of attribute dictionaries such as `[{'Color': 'Black'}, {'Material': 'Woven Fabric'}]`. Rather than expanding all attributes into separate columns, only the `Color` value is extracted using a regex lookbehind pattern. This decision was made because `Color` is the only attribute with sufficient coverage to be analytically useful for imputation grouping. All other attributes, including `Material`, `Style`, and similar fields, fall below a meaningful coverage threshold when assessed across the full dataset.
-
-After extraction, the `description` column is dropped entirely and recorded in the drop log. The `color` column is `NA` for products where no `Color` attribute is present in the description string.
-
-### Section G — Size
-
-The raw `size` field is a single comma delimited string that can represent fundamentally different measurement systems depending on the product type. A direct imputation on this field would conflate incompatible domains. The cleaning step classifies each row into one of the following size systems using `fcase()`:
-
-- `one_size` — literal value is `one-size`
-- `dimensions` — contains a dimension pattern such as `135*200` (bedding and home products)
-- `bra` — contains a bra size pattern such as `34B(75B)`
-- `kids` — contains age or inch-based size markers such as `4Y` or `IN)`
-- `jeans` — contains waist-inseam patterns such as `W28 L30`
-- `shoe_intl` — contains `CN` or `EUR` numeric size markers
-- `shoe_us` — contains `US` numeric size markers without `CN` or `EUR`
-- `petite` — contains the word `Petite`
-- `tall` — contains the word `Tall`
-- `plus` — contains extended size markers such as `0XL` through `6XL`
-- `eu_clothing` — contains European clothing size patterns such as `XS(34)`
-- `us_letter` — starts with a digit, indicating a US numeric size code
-- `volume_length` — contains `ml`, `inch`, or similar volume or length markers
-- `standard` — contains standard letter sizes such as `XS`, `S`, `M`, `L`, `XL`, `XXL`
-- `unknown` — does not match any of the above
-
-From the classified size string, three additional columns are derived:
-
-- `size_labels` — the letter label portion of each size option, for example `XS, S, M, L` extracted from a `standard` or `eu_clothing` string, or the raw string for `shoe_us`
-- `size_us` — the US numeric size extracted from parentheses for clothing systems, or from the `US` marker in `shoe_intl` strings
-- `size_count` — the number of distinct size options available, set to `1` for `one_size` and `NA` for systems where counting options is not meaningful
-
-Bedding and home products classified as `dimensions` populate `dimensions_raw` with the raw dimension string and leave `size_labels`, `size_us`, and `size_count` as `NA`. All other product types do the inverse: they populate the clothing size columns and leave `dimensions_raw` as `NA`. All size system columns are present in every row of the final output regardless of applicability. The original `size` column is dropped after extraction and recorded in the drop log.
-
-This design decision was made deliberately so that the final file remains a single wide table. Imputation algorithms can group rows by `size_system` and operate on the appropriate column for each group without requiring a join or reshape step.
-
-### Section H — Final assembly
-
-After all cleaning sections have run, the handled columns are listed explicitly. Any remaining columns not addressed by sections C through G are identified and carried forward to avoid accidental loss. Priority columns are ordered first: `sku`, `url`, `name`, `price`, `price_flag`, `brand`, `color`, `size_system`, `size_count`, `size_labels`, `images`, `size_us`, and `dimensions_raw`. Remaining unhandled columns follow. The result is converted back to a `data.frame` named `df_clean`.
-
-Note: the `images` column is carried forward in its raw form in the current version of this script. Dedicated image URL deduplication and count extraction is deferred to a subsequent cleaning stage.
-
-### Section I — Summary and drop log
-
-A console summary is printed on every run showing row count, column count, all column names, missing value counts per column, size system distribution, price flag distribution, and the full drop log. This makes every run self documenting and allows the analyst to verify structural outcomes without opening the output file.
-
-### Section J — Export
-
-The cleaned dataset is written to `Output/shein_cleaned.csv` using `write.csv()` with `na = ""` so that `NA` values are represented as empty cells rather than the literal string `NA`. This format is compatible with most imputation libraries in both R and Python.
+Columns for non-applicable size systems are left as `NA` intentionally to preserve the one-file structure required for imputation grouping.
 
 ## Repository structure
 
 ```text
 Shein_Data_Cleaning_Assignment/
+├── pipeline.r
 ├── 00_config.R
 ├── 01_ingest.R
 ├── 02_diagnosis.R
 ├── 03_clean.R
 ├── README.md
-├── readme.rmd
+├── Shein_Assignment_Progress_Report_1.docx
 ├── Raw_data/
 │   └── shein_sample.csv
 └── Output/
     ├── shein_exploratory_diagnostics.xlsx
-    ├── shein_cleaned.csv
-    └── shein_data_quality_report.html
+    └── shein_cleaned.csv
 ```
+
+The standalone scripts (`00_config.R`, `01_ingest.R`, `02_diagnosis.R`, `03_clean.R`) are earlier development versions. The consolidated `pipeline.r` is the current master script and should be used for running the full workflow.
 
 ## Required packages
 
-The scripts currently rely on the following R packages:
+The pipeline relies on the following R packages:
 
-- `data.table`
-- `dplyr`
-- `readr`
-- `stringr`
-- `stringi`
-- `tidyr`
-- `lubridate`
-- `purrr`
-- `scales`
-- `openxlsx`
+- `data.table` — fast CSV ingestion with `fread()`, in-memory cleaning, and export with `fwrite()`
+- `dplyr` — data manipulation in the diagnostics stage
+- `readr` — `parse_number()` and type helpers
+- `stringr` — string utilities and regex extraction
+- `stringi` — encoding safe string operations and mojibake fixes
+- `tidyr` — reshape helpers in diagnostics
+- `lubridate` — date parsing
+- `purrr` — `map_dfr()` and `map2_dfr()` functional helpers
+- `scales` — formatting for output
+- `openxlsx` — Excel workbook creation
 
-You can install them with:
+Install with:
 
 ```r
 install.packages(c(
@@ -170,123 +136,61 @@ install.packages(c(
 
 ## Input data requirements
 
-The pipeline currently expects the raw dataset to be stored at:
+The pipeline expects the raw dataset to be stored at:
 
-```r
-"Raw_data/shein_sample.csv"
+```text
+Raw_data/shein_sample.csv
 ```
 
-The scripts assume the file is present before the workflow is run. If it is missing, `00_config.R` stops with a clear error message telling the user where the file should be placed.
+If the file is missing, the pipeline stops with a clear error message telling the user where to place it.
 
 ## How to run the project
 
-### Option 1. Run script by script
+Run the consolidated pipeline from start to finish:
 
 ```r
-source("00_config.R")
-source("01_ingest.R")
-source("02_diagnosis.R")
-source("03_clean.R")
+source("pipeline.r")
 ```
 
-### Option 2. Run from the cleaning script
+This executes all three stages sequentially: configuration and ingestion, diagnostics, and cleaning. The pipeline produces both the diagnostics workbook and the cleaned CSV in the `Output` folder.
 
-Since `03_clean.R` checks whether `raw_file` and `detected` already exist and sources the upstream scripts if needed, you can also run:
+## Main outputs
 
-```r
-source("00_config.R")
-source("03_clean.R")
-```
+The pipeline produces two outputs:
 
-## Main output
+**Diagnostics workbook** — `Output/shein_exploratory_diagnostics.xlsx` containing twenty sheets covering dataset overview, detected columns, variable types, missingness by variable and row, duplicate checks, image URL duplication summary, numeric range checks, numeric parse issues, price and discount checks, URL checks, datetime checks, text quality, level summaries, description attribute extraction, and problem rows. Excel sheets are capped at 1,000 rows for readability.
 
-The main outputs currently produced by the project are:
-
-### Diagnostics workbook
-
-```r
-Output/shein_exploratory_diagnostics.xlsx
-```
-
-The workbook includes sheets for:
-
-1. overview
-2. detected columns
-3. variable types
-4. missingness by variable
-5. missingness by row
-6. duplicate summary
-7. exact duplicate examples
-8. duplicate URL examples
-9. image URL duplication summary
-10. range checks
-11. numeric parse issues
-12. price and discount checks
-13. URL checks
-14. datetime checks
-15. text quality
-16. level summary
-17. description attribute names
-18. description attribute values
-19. description name value counts
-20. problem rows
-
-These sheets are explicitly created in the workbook writing section of `02_diagnosis.R`.
-
-### Cleaned dataset
-
-```r
-Output/shein_cleaned.csv
-```
-
-A single wide CSV, one row per product SKU, containing the following columns:
-
-| Column | Description |
-|---|---|
-| `sku` | Deduplicated product identifier with `SKU:` prefix stripped |
-| `url` | Product page URL carried forward unchanged |
-| `name` | Product name carried forward unchanged |
-| `price` | Numeric price with currency symbol removed |
-| `price_flag` | Quality flag: `ok`, `missing`, `invalid`, or `outlier_high` |
-| `brand` | Cleaned brand name; `NA` where unrecoverable |
-| `color` | Color attribute extracted from description; `NA` where absent |
-| `size_system` | Classified size domain for this product |
-| `size_count` | Number of distinct size options available |
-| `size_labels` | Letter labels for clothing sizes; `NA` for non-clothing |
-| `size_us` | US numeric sizes; `NA` for non-clothing |
-| `dimensions_raw` | Raw dimension string for bedding products; `NA` for clothing |
+**Cleaned dataset** — `Output/shein_cleaned.csv` containing one row per unique SKU with all cleaning transformations applied. This file is structured for downstream missing value imputation with all size system columns present regardless of applicability.
 
 ## Diagnostics currently covered
 
-The project currently checks the following areas.
-
 ### 1. Overview and structure
 
-The workbook records total rows, total columns, total cells, exact duplicate rows, rows with at least one missing value, and columns with at least one missing value.
+Total rows, total columns, total cells, exact duplicate rows, rows with at least one missing value, and columns with at least one missing value.
 
 ### 2. Column detection
 
-A helper function searches column names and attempts to identify fields such as product name, price, discount, color, size, category, material, product URL, image URL, and scraped timestamp. These are heuristic matches based on column name patterns.
+A helper function searches column names with heuristic patterns to identify fields such as product name, price, discount, color, size, category, material, product URL, image URL, and scraped timestamp.
 
 ### 3. Description key value extraction
 
-The workflow extracts attribute name and attribute value pairs from the `description` column using a regex pattern that looks for text of the form `'Field': 'Value'`. It then summarises unique attribute names, unique attribute values, and attribute name plus value combinations.
+Extracts attribute name and attribute value pairs from the description column using a regex pattern for `'Field': 'Value'` syntax. Summarises unique attribute names, unique attribute values, and attribute name plus value combinations.
 
 ### 4. Missingness
 
-Missing values are summarised both by variable and by row. Blank strings are also treated as missing for these checks.
+Missing values are computed once and reused across both the variable types summary and the missingness summary. Blank strings are treated as missing. Row level missingness is also summarised.
 
 ### 5. Duplicates
 
-The project checks for exact duplicate rows, duplicate product URLs, duplicate product names, duplicate image URLs, and records that contain repeated image URLs within exploded image lists.
+Checks for exact duplicate rows, duplicate product URLs, duplicate product names, duplicate image URLs, and records containing repeated image URLs within their image lists. The within-record image check uses a vectorised `vapply()` approach.
 
 ### 6. Numeric parsing and range checks
 
-Numeric like columns are identified by type and name patterns. The workflow parses numbers, records failed parses, calculates summary statistics, and flags IQR based outliers, negatives, and zeros. It also keeps a list of numeric parse issues. The scripts treat values such as `undefined`, `null`, and similar strings as messy missing values.
+Numeric and numeric-like columns are identified by type and name patterns. The workflow parses numbers, records failed parses, calculates summary statistics, and flags IQR based outliers, negatives, and zeros. Values such as `undefined`, `null`, and similar strings are treated as messy missing values.
 
 ### 7. Price and discount checks
 
-Where relevant columns are detected, the pipeline checks for prices that could not be parsed, prices below zero, prices equal to zero, discounts below zero, and discounts above one hundred.
+Where relevant columns are detected, checks for prices that could not be parsed, prices below zero, prices equal to zero, discounts below zero, and discounts above one hundred.
 
 ### 8. URL checks
 
@@ -294,77 +198,37 @@ Product and image URLs are checked for basic web format validity using `http://`
 
 ### 9. Datetime checks
 
-If a scraped timestamp column is found, the pipeline attempts to parse the values using predefined date orders and reports parsed counts, unparsed counts, earliest date, and latest date.
+If a scraped timestamp column is found, attempts to parse values using predefined date orders and reports parsed counts, unparsed counts, earliest date, and latest date.
 
 ### 10. Text quality checks
 
-The workflow performs encoding safe text cleaning and then checks blank strings, leading or trailing spaces, repeated spaces, newline characters, very long text, maximum text length, and unique counts for character columns.
+Performs encoding safe text cleaning and checks blank strings, leading or trailing spaces, repeated spaces, newline characters, very long text, maximum text length, and unique counts for character columns.
 
 ### 11. Problem rows
 
-The project creates an issue flag table and then exports a sample of rows with one or more detected issues. These rows help with manual review and evidence collection for the diagnostics log and cleaning report.
+Creates an issue flag table and exports a sample of rows with one or more detected issues for manual review and evidence collection.
 
-## Progress made so far
+## Cleaning transformations applied
 
-Based on the current state of the scripts, the following work has been completed:
+The cleaning stage (`03_clean`) applies the following transformations, each logged in the drop log:
 
-- central configuration file drafted
-- raw data ingestion script drafted and validated
-- exploratory diagnostics workflow built
-- description field parsing and summarisation added
-- workbook output for diagnostics created
-- support for messy missing values added
-- UTF 8 safe text cleaning added for Excel export and text quality checks
-- image URL duplication review added
-- problem row flagging added
-- structural cleaning script `03_clean.R` drafted and completed covering SKU, Price, Brand, Color, and Size
-- size system classification across fifteen categories implemented
-- single file wide output design implemented so imputation can operate without a reshape step
-- drop log implemented to document every column removal or replacement with explicit rationale
-- cleaned CSV exported to `Output/shein_cleaned.csv`
-- a simple progress report has already been prepared separately
+1. **SKU** — prefix stripped, rows deduplicated by SKU
+2. **Price** — currency symbol stripped, coerced to numeric, flagged for missing/invalid/outlier values
+3. **Brand** — mojibake fixed via latin-ascii transliteration, brand name extracted before corrupted characters, empty values set to NA
+4. **Color** — extracted from serialised description field using a capturing group regex, description column dropped
+5. **Size** — spacing normalised, modifier flags extracted, classified into size systems, structured columns derived per system using vectorised data.table operations, range-notation counts marked as NA
+6. **Images** — URLs extracted and deduplicated, count computed, raw column replaced
 
-## Suggested next steps
+## Performance notes
 
-The project has moved from diagnostics into active cleaning. The next logical steps are:
+Several optimisations were applied during the review process:
 
-1. add image URL deduplication and image count extraction as an extension to `03_clean.R`
-2. review `unknown` size system rows manually to determine whether additional classification rules are warranted
-3. create a diagnostics log and problem inventory for the report
-4. produce a final report in HTML, Word, or both using `04_report.Rmd`
-5. add a reproducible master script such as `run_pipeline.R`
-
-## Suggested future repository structure
-
-```text
-Shein_Data_Cleaning_Assignment/
-├── 00_config.R
-├── 01_ingest.R
-├── 02_diagnosis.R
-├── 03_clean.R
-├── 04_report.Rmd
-├── run_pipeline.R
-├── README.md
-├── readme.rmd
-├── Raw_data/
-│   └── shein_sample.csv
-└── Output/
-    ├── shein_exploratory_diagnostics.xlsx
-    ├── shein_cleaned.csv
-    ├── diagnostics_log.xlsx
-    ├── problem_inventory.txt
-    └── shein_data_quality_report.html
-```
-
-## Reproducibility notes
-
-To make the project easy for another user to run:
-
-- keep all paths relative
-- store the raw CSV in the `Raw_data` folder
-- commit the scripts and README files
-- include package installation instructions
-- if the CSV is too large for regular Git, use Git LFS or provide a clear download instruction in this README
+- Raw data is kept as a `data.table` from `fread()` through to cleaning, avoiding an unnecessary `data.table` to `data.frame` to `data.table` round-trip
+- Missing counts are computed once and reused across multiple diagnostic summaries
+- The within-record image URL duplication check uses `vapply()` instead of `rowwise()` which was extremely slow on 111k rows
+- An unused `separate_rows()` image explosion that computed results never written to the workbook was removed
+- Export uses `fwrite()` instead of `write.csv()` for faster output
+- Size column extraction uses vectorised `data.table` subset-assign per system instead of row-by-row `mapply()`
 
 ## Troubleshooting
 
@@ -378,20 +242,16 @@ Raw_data/shein_sample.csv
 
 ### Error: more columns than column names
 
-This usually means the CSV contains irregular rows or messy quoting. The current pipeline uses `fread()` with `fill = TRUE` to handle this more safely than base `read.csv()`.
+This usually means the CSV contains irregular rows or messy quoting. The pipeline uses `fread()` with `fill = TRUE` to handle this more safely than base `read.csv()`.
 
 ### Invalid UTF 8 byte sequence errors
 
-These can happen when scraped text contains broken encoding. The current workflow uses `stringi::stri_enc_toutf8()` and removes control characters before Excel export and text based checks.
+These can happen when scraped text contains broken encoding. The workflow uses `stringi::stri_enc_toutf8()` and removes control characters before Excel export and text based checks.
 
 ### Parsing failures such as `undefined`
 
-The pipeline treats several strings as messy missing values during numeric parsing. You can expand `MESSY_MISSING_VALUES` in `00_config.R` if new placeholders appear.
-
-### Size system classified as `unknown`
-
-If a product's size string does not match any of the fifteen classification rules in Section G of `03_clean.R`, it is assigned the `unknown` category and its derived size columns are set to `NA`. Review the raw size values in this group to determine whether additional `fcase()` rules are warranted.
+The pipeline treats several strings as messy missing values during numeric parsing. You can expand `MESSY_MISSING_VALUES` in the config section if new placeholders appear.
 
 ## Author notes
 
-This README reflects the current project scripts and outputs already drafted in the repository and can be updated again once the reporting stage is added. It is designed to work as both assignment documentation and a setup guide for anyone cloning the repository.
+This README reflects the current state of `pipeline.r` after supervisor review and corrections. It is designed to work as both assignment documentation and a setup guide for anyone cloning the repository.

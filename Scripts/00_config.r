@@ -8,8 +8,8 @@
 # 1. File paths
 # -----------------------------------------------------------------------------
 
-RAW_FILE_PATH    <- "Raw_data/shein_sample.csv"
-OUTPUT_DIR       <- "Output"
+RAW_FILE_PATH    <- "../Raw_data/shein_sample.csv"
+OUTPUT_DIR       <- "../Output"
 DIAGNOSTICS_FILE <- file.path(OUTPUT_DIR, "shein_exploratory_diagnostics.xlsx")
 REPORT_FILE      <- file.path(OUTPUT_DIR, "shein_data_quality_report.html")
 
